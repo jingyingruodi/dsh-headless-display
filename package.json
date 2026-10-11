@@ -1,0 +1,35 @@
+{
+  "name": "dsh-isolated-display",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "在隔离的虚拟 X display（Xephyr）里运行并操作 GUI 程序：7 个 Agent 工具 + 右侧栏实时画面面板，不抢焦点、不占桌面。",
+  "exports": {
+    ".": "./plugin.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "plugin.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "Isolated Display",
+    "description": "在隔离的虚拟 X display 里运行与操作 GUI 程序，不抢用户焦点、不占用桌面。"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

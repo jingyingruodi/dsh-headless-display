@@ -1,0 +1,12 @@
+# dsh-isolated-display —— 在隔离虚拟 X display（Xephyr）里驱动 GUI 程序。
+#
+# parentDisplay / xauthority 建议显式给出：dsh 宿主进程通常**不继承**桌面会话的
+# DISPLAY 与 XAUTHORITY（实测 host env 里两者都没有）。代码里有自动探测兜底，
+# 但显式配置最稳。
+- insert:
+    - id: gui-isolation
+      name: dsh-isolated-display
+      config:
+        parentDisplay: ':1'
+        xauthority: /run/user/1000/xauth_ZALigT
+        defaultSize: 1280x720

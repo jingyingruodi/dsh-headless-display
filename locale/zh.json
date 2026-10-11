@@ -1,0 +1,1 @@
+{ "meta": { "title": "隔离显示", "description": "在隔离的虚拟 X display（Xephyr）里运行并操作 GUI 程序，不抢焦点、不占桌面。适合无人值守的自动化测试。" } }
