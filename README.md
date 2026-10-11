@@ -1,10 +1,27 @@
 # dsh-headless-display
 
-在**隔离的虚拟 X display**（Xephyr）里运行并操作 GUI 程序 —— 不抢用户焦点、不占用桌面。
-给 Agent 提供 7 个工具，并在 DSH Web 界面里提供一个**可看可点的实时画面面板**。
+在**隔离的虚拟 X display** 里运行并操作 GUI 程序 —— 默认**桌面上零窗口、零干扰**。
+给 Agent 提供 **9 个工具**，并在 DSH Web 界面里提供一个**可看可点的实时画面面板**。
+
+- **默认后端 `Xvfb`（真 headless）**：桌面上不开任何窗口
+- 想看/想亲手操作时，用面板上的「打开真实窗口」按需弹出（`x11vnc` + VNC 查看器）
+- 可选后端 `Xephyr`：直接在用户桌面上开一个可见窗口（旧的可见行为）
 
 > 本插件由 `dsh-ego-browser` 与自建的 `tools/isolated_display.sh` 演进而来；
 > 设计目标见下文「为什么需要隔离 display」。
+
+### 名称沿革（为什么改过几次名）
+
+`@local/isolated-display` → `@local/gui-isolation` → `dsh-isolated-x11` → **`dsh-headless-display`**
+
+改动原因**不是**反复无常，而是 dsh 的一个硬约束：**宿主插件模块按「包名」做进程级缓存**
+（详见下文「维护者必读」第 2 个坑）—— 改了 JS 之后，
+`set_plugin` 开关、`remove_bundle` + `install_bundle`、改入口文件名、换目录路径
+**都无法加载新代码**，只有**换包名**或**重启 dsh** 才行。
+
+所以开发期每改一次宿主代码就得换一次名；最后一次改名同时反映了行为变化
+（默认后端从 Xephyr 改为 headless 的 Xvfb）。GitHub 仓库也随之改名，
+旧链接会自动重定向；旧提交信息里的名字是当时的历史事实，保留不改写。
 
 ---
 
@@ -52,17 +69,22 @@
 | 抓某个窗口的图 | ❌ XWayland 下 `import -window root` 直接 `BadMatch` |
 | 安静地跑自动化 | ❌ 一定会抢焦点、占满屏，干扰用户 |
 
-**解法**：Xephyr 在用户桌面上开一个**普通窗口**，但内部是一个**独立的 X server**。
-在那个 display 里，XTEST / XSendEvent / 抓屏全部正常，且与用户会话**完全隔离** ——
-用户照常用电脑，自动化在窗口内部跑。
+**解法**：另起一个**独立的 X server**，自动化全部在它内部进行，与用户会话完全隔离。
+
+- **默认用 `Xvfb`**：它是**纯 headless** 的 —— 桌面上**一个窗口都没有**，用户零感知。
+- 需要看到真实画面时，再用「打开真实窗口」把它投到一个窗口里（见下）。
+- 也可以选 `Xephyr` 后端：它会在用户桌面上开一个普通窗口，内部同样是独立 X server。
+
+在这个独立 display 里，XTEST / XSendEvent / 抓屏全部正常。
 
 ---
 
 ## 功能
 
-- **7 个 Agent 工具**：启停隔离 display、在其中跑命令、抓屏、列窗口、注入键鼠
-- **Web 侧边栏面板**：实时画面 + 点击操作 + 文本/按键注入 + 窗口列表
-- **宿主 HTTP API**：`/gui-isolation/*`，面板与外部脚本都可用
+- **9 个 Agent 工具**：启停隔离 display、在其中跑命令、抓屏、列窗口、注入键鼠、
+  以及按需弹出/收起真实窗口
+- **Web 侧边栏面板**：实时画面 + 点击操作 + 文本/按键注入 + 窗口列表 + 真实窗口开关
+- **宿主 HTTP API**：8 条 `/gui-isolation/*` 路由，面板与外部脚本都可用
 - **零 npm 依赖**：纯 JS，无构建步骤
 
 ---
@@ -118,12 +140,14 @@ iso_display_stop ":9"
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `parentDisplay` | `$DISPLAY` 或 `:1` | 承载 Xephyr 窗口的桌面 display |
+| `backend` | `xvfb` | `xvfb`＝纯 headless（桌面零窗口）；`xephyr`＝在桌面上开可见窗口 |
+| `parentDisplay` | `$DISPLAY` 或 `:1` | 承载 Xephyr 窗口的桌面 display（**仅 `backend: xephyr` 需要**） |
 | `xauthority` | 自动探测 | X 授权文件 |
 | `defaultSize` | `1280x720` | 默认分辨率 |
 | `displayRange` | `[9, 20]` | 可用的 display 编号区间 |
-| `stateDir` | `~/.dsh-gui-isolation` | 记录已启动 display 的目录 |
-| `xephyrPath` / `xdotoolPath` / `importPath` | 同名的 PATH 查找 | 自定义可执行文件路径 |
+| `stateDir` | `~/.dsh-headless-display` | 记录已启动 display 的目录 |
+| `vncPortBase` | `5900` | 弹出真实窗口时 x11vnc 的起始端口（只监听回环） |
+| `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
 
 > ⚠️ `parentDisplay` 与 `xauthority` **建议显式配置** —— 见下面第 3 个坑。
 
@@ -178,12 +202,18 @@ curl -X POST -H 'content-type: application/json' \
 ## Web UI 面板
 
 `client.js` 提供一个「隔离显示」面板：实时画面（约 0.9s 轮询）、点画面即在该坐标点击、
-文本输入、常用按键、窗口列表、启停按钮。
+文本输入、常用按键、窗口列表、启停按钮，以及**「打开真实窗口 / 关闭真实窗口」**开关。
 
 落点策略：
 
-- 装了 **`dsh-better-sidebar`** → 注册成**右侧栏标签页**（`ctx.betterSidebar.registerTab`）
-- 没装 → 回退成 `shell.overlay` 上的**浮动面板**
+- 装了 **`dsh-better-sidebar`** → 注册成**右侧栏标签页**（`ctx.betterSidebar.registerTab`）。
+  标签页渲染在侧栏那一列内部，结构上不可能覆盖其它区域。
+- 没装 → **不注册任何 UI**（Agent 工具与 HTTP API 仍然可用）。
+
+> ⚠️ 曾经有一个「回退到 `shell.overlay` 浮动面板」的分支，**已彻底删除**：
+> `shell.overlay` 是贯穿整个窗口的浮层，配上 `height:100%` + 不透明背景的面板
+> 会把整个 Web UI 盖死，用户点不到任何东西，只能从外部远程窗口通知 Agent 才回滚掉。
+> **教训：绝不要把大尺寸组件挂到 frame-wide 浮层上；宁可没有 UI，也不能挡住用户。**
 
 样式只用宿主主题 token（`--dsw-alias-*`），不引入任何 Harness Client 包。
 
@@ -193,20 +223,22 @@ curl -X POST -H 'content-type: application/json' \
 
 ```
 ┌─ 浏览器 ────────────────────────────────┐
-│ client.js → 侧边栏标签页 / 浮动面板       │
+│ client.js → 右栏标签页（better-sidebar）  │
 │   fetch /gui-isolation/snapshot  (轮询)  │
 │   fetch /gui-isolation/input     (点击)  │
 └───────────────┬─────────────────────────┘
                 │ HTTP
 ┌───────────────▼─────────────────────────┐
 │ plugin.js（宿主）                        │
-│   ctx.tools.register(...)   × 7 个工具   │
-│   ctx.webServer.register(...)  × 6 路由  │
+│   ctx.tools.register(...)   × 9 个工具   │
+│   ctx.webServer.register(...)  × 8 路由  │
 │   ctx.betterSidebar 由 client 侧使用      │
 └───────────────┬─────────────────────────┘
                 │ execFile
 ┌───────────────▼─────────────────────────┐
-│ Xephyr（独立 X server :9）                │
+│ Xvfb（默认，headless） / Xephyr（可选）    │
+│   独立 X server（如 :9）                  │
+│   默认桌面上无窗口；按需 popout 出真实窗口  │
 │   你的被测程序跑在这里                     │
 └─────────────────────────────────────────┘
 ```
@@ -329,8 +361,8 @@ ctx.inject(['betterSidebar'], cb)
 
 | 文件 | 说明 |
 |---|---|
-| `plugin.js` | 宿主：7 个工具 + 6 条 HTTP 路由 |
-| `client.js` | 浏览器：侧边栏标签页 / 浮动面板 |
+| `plugin.js` | 宿主：9 个工具 + 8 条 HTTP 路由 |
+| `client.js` | 浏览器：右栏标签页（better-sidebar 缺失时不注册任何 UI） |
 | `cordis.patch.yml` | bundle patch（插入 `gui-isolation` 行 + 配置） |
 | `locale/{en,zh}.json` | 插件卡片标题与描述 |
 | `icon.svg` | 插件图标 |

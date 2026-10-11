@@ -98,6 +98,12 @@ export function apply(ctx, config = {}) {
     try { await run('xdpyinfo', ['-display', display], { timeout: 4000, env: envFor(display) }); return true } catch { return false }
   }
 
+  // 进程是否还活着（用于判断 visible / 清理陈旧状态）
+  function pidAlive(pid) {
+    if (!pid) return false
+    try { process.kill(pid, 0); return true } catch { return false }
+  }
+
   async function listDisplays() {
     if (!existsSync(stateDir)) return []
     const names = (await readdir(stateDir)).filter((f) => f.endsWith('.json'))
@@ -105,7 +111,16 @@ export function apply(ctx, config = {}) {
     for (const f of names) {
       const display = ':' + f.replace(/\.json$/, '')
       const st = await readState(display)
-      out.push({ display, alive: await alive(display), size: st?.size, pid: st?.pid, backend: st?.backend, visible: !!st?.viewerPid })
+      const isAlive = await alive(display)
+      // ★ 自愈：display 已经死了就把这条状态记录清掉，避免留下陈旧条目
+      //   （包名改过几次，历史上遗留的 stateDir/条目都可能指向早已不存在的 display）
+      if (!isAlive && st) {
+        try { await rm(stateFile(display), { force: true }) } catch {}
+      }
+      // ★ visible 不能只看「有没有记过 viewerPid」—— 查看器可能早已退出，
+      //   那样 UI 会一直显示「关闭真实窗口」而实际什么都没有。
+      const visible = isAlive && pidAlive(st?.viewerPid)
+      out.push({ display, alive: isAlive, size: st?.size, pid: st?.pid, backend: st?.backend, visible })
     }
     return out.sort((a, b) => a.display.localeCompare(b.display, undefined, { numeric: true }))
   }
