@@ -1,4 +1,4 @@
-// dsh-isolated-display —— 在隔离的虚拟 X display 里驱动 GUI 程序
+// dsh-isolated-x11 —— 在隔离的虚拟 X display 里驱动 GUI 程序
 //
 // ── 为什么需要 ─────────────────────────────────────────────────────────────
 //   用户的桌面是 KDE **Wayland**。在 Wayland 主桌面上：
@@ -30,7 +30,7 @@ import path from 'node:path'
 const run = promisify(execFile)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-export const name = 'dsh-isolated-display'
+export const name = 'dsh-isolated-x11'
 export const inject = ['tools']
 
 // 不声明 `Config`：Cordis 要求它是一个实现了 Standard Schema 的对象
@@ -43,7 +43,7 @@ const output = (schema) => ({ schema, render: (_args, value) => text(value) })
 const okSchema = { type: 'object', additionalProperties: true }
 
 export function apply(ctx, config = {}) {
-  const stateDir = config.stateDir || path.join(os.homedir(), '.dsh-isolated-display')
+  const stateDir = config.stateDir || path.join(os.homedir(), '.dsh-isolated-x11')
   const [rangeLo, rangeHi] = config.displayRange || [9, 20]
   const defaultSize = config.defaultSize || '1280x720'
   const bin = {

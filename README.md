@@ -1,4 +1,4 @@
-# dsh-isolated-display
+# dsh-isolated-x11
 
 在**隔离的虚拟 X display**（Xephyr）里运行并操作 GUI 程序 —— 不抢用户焦点、不占用桌面。
 给 Agent 提供 7 个工具，并在 DSH Web 界面里提供一个**可看可点的实时画面面板**。
@@ -76,7 +76,7 @@ plugin_manager(action: "install_bundle", target: "<本目录的绝对路径>")
 安装后确认：
 
 ```
-plugin_manager(action: "list_bundles")     # 应出现 dsh-isolated-display，rows: gui-isolation
+plugin_manager(action: "list_bundles")     # 应出现 dsh-isolated-x11，rows: gui-isolation
 ```
 
 ### 验证

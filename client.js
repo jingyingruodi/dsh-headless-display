@@ -1,4 +1,4 @@
-// dsh-isolated-display —— Web UI 那一半
+// dsh-isolated-x11 —— Web UI 那一半
 //
 // 提供一个「隔离显示」面板：
 //   * 实时画面（轮询宿主 /gui-isolation/snapshot 拿 PNG）
@@ -12,7 +12,7 @@
 // 样式只用宿主主题 token（--dsw-alias-*）；不引入任何 Harness Client 包。
 
 window.__ModuleLoader__.load({
-  id: 'dsh-isolated-display',
+  id: 'dsh-isolated-x11',
   factory(require) {
     const React = require('react')
     const h = React.createElement

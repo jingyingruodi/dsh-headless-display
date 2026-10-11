@@ -1,5 +1,5 @@
 {
-  "name": "dsh-isolated-display",
+  "name": "dsh-isolated-x11",
   "version": "1.0.0",
   "private": true,
   "type": "module",
