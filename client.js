@@ -221,22 +221,28 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
-        // ⚠️ 事故记录（2026-10-11）：这里原本在 `ctx.get('betterSidebar')` 为假时
-        //    回退到 `shell.overlay` 注册浮层面板。`shell.overlay` 是**贯穿整个窗口的浮层**，
+        // ⚠️ 事故记录（2026-10-11）：这里原本在 better-sidebar 不可用时回退到
+        //    `shell.overlay` 注册浮层面板。`shell.overlay` 是**贯穿整个窗口的浮层**，
         //    而面板容器写了 height:'100%' + 不透明背景 —— 结果把整个 Web UI 盖死，
         //    用户点不到任何东西，只能从外部远程窗口通知才回滚掉。
-        //
         //    教训：**绝不要**把大尺寸组件挂到 frame-wide 浮层上；宁可没有 UI，
-        //    也不能挡住用户。现在只在 better-sidebar 可用时注册一个**右栏标签页**
-        //    （它渲染在侧栏内部，结构上不可能覆盖其它区域）；没有 better-sidebar
-        //    就只保留 Agent 工具与 HTTP API，不注册任何 UI。
-        const hasBetter = (() => { try { return !!ctx.get('betterSidebar') } catch { return false } })()
-        if (!hasBetter) return
-
+        //    也不能挡住用户。现在**只**注册右栏标签页（渲染在侧栏内部，
+        //    结构上不可能覆盖其它区域）。
+        //
+        // 另一个坑（2026-10-11 实测）：**不要用 `ctx.get('betterSidebar')` 做可用性判断**。
+        //    better-sidebar 是用 `ctx.provide('betterSidebar', service)` 发布的，
+        //    它**晚于**本插件 apply；`ctx.get` 此刻只会拿到 undefined，于是标签页永远不注册
+        //    （表现为「右栏根本没有这个选项」）。而且它不在 Cordis 的 Service 目录里，
+        //    用 cordis_inspect_query 也查不到。
+        //    正确做法：直接 `ctx.inject(['betterSidebar'], cb)` —— Cordis 会等待依赖就绪；
+        //    真的没有 better-sidebar 时回调永不执行，自然也就没有任何 UI（安全）。
         ctx.inject(['betterSidebar'], (bctx) => {
           bctx.effect(() => bctx.betterSidebar.registerTab({
             id: 'gui-isolation',
             title: '隔离显示',
+            description: '查看并操作隔离虚拟 display（Xephyr）里的实时画面，不抢焦点、不占桌面。',
+            order: 40,
+            single: true,
             component: Panel,
           }))
         })
