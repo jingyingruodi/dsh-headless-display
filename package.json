@@ -1,9 +1,9 @@
 {
-  "name": "dsh-isolated-x11",
-  "version": "1.0.1",
+  "name": "dsh-headless-display",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "在隔离的虚拟 X display（Xephyr）里运行并操作 GUI 程序：7 个 Agent 工具 + 右侧栏实时画面面板，不抢焦点、不占桌面。",
+  "description": "隔离的 headless 虚拟 X display：默认桌面上零窗口、零干扰；面板里可实时查看与操作，按需弹出真实窗口。给 Agent 9 个工具 + HTTP API。",
   "exports": {
     ".": "./plugin.js",
     "./client": "./client.js",

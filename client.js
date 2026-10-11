@@ -1,4 +1,4 @@
-// dsh-isolated-x11 —— Web UI 那一半
+// dsh-headless-display —— Web UI 那一半
 //
 // 提供一个「隔离显示」面板：
 //   * 实时画面（轮询宿主 /gui-isolation/snapshot 拿 PNG）
@@ -12,7 +12,7 @@
 // 样式只用宿主主题 token（--dsw-alias-*）；不引入任何 Harness Client 包。
 
 window.__ModuleLoader__.load({
-  id: 'dsh-isolated-x11',
+  id: 'dsh-headless-display',
   factory(require) {
     const React = require('react')
     const h = React.createElement
@@ -95,6 +95,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [text, setText] = useState('')
       const [wins, setWins] = useState([])
+      const [visible, setVisible] = useState(false)   // 是否已弹出「真实窗口」
       const imgRef = useRef(null)
       const lastUrl = useRef(null)
 
@@ -136,19 +137,46 @@ window.__ModuleLoader__.load({
 
       const doStart = async () => {
         setBusy(true)
-        try { await postJson('/start', {}); await refreshInfo() }
+        try { await postJson('/start', {}); setVisible(false); await refreshInfo() }
         catch (e) { setErr(String(e.message || e)) } finally { setBusy(false) }
       }
       const doStop = async () => {
         if (!display) return
         setBusy(true)
-        try { await postJson('/stop', { display }); setDisplay(null); await refreshInfo() }
+        try { await postJson(`/stop?display=${encodeURIComponent(display)}`, {}); setVisible(false); setDisplay(null); await refreshInfo() }
         catch (e) { setErr(String(e.message || e)) } finally { setBusy(false) }
       }
+      // 弹出/关闭「真实窗口」：默认是纯 headless，桌面上没有任何窗口。
+      // 想看或想亲手操作时才弹；关掉即回到静默，里面的程序不重启。
+      const togglePopout = async () => {
+        if (!display) return
+        setBusy(true)
+        try {
+          await postJson(`/popout?display=${encodeURIComponent(display)}`, visible ? {} : {})
+            .catch(async () => { throw new Error('popout failed') })
+          setVisible(true); setErr(null)
+        } catch (e) {
+          // 已经弹过就转为关闭
+          try {
+            await postJson(`/popin?display=${encodeURIComponent(display)}`, {})
+            setVisible(false); setErr(null)
+          } catch (e2) { setErr(String(e2.message || e2)) }
+        } finally { setBusy(false) }
+      }
+      const doPopin = async () => {
+        if (!display) return
+        setBusy(true)
+        try { await postJson(`/popin?display=${encodeURIComponent(display)}`, {}); setVisible(false); setErr(null) }
+        catch (e) { setErr(String(e.message || e)) } finally { setBusy(false) }
+      }
+
       const send = async (payload) => {
         if (!display) return
-        try { await postJson('/input', { display, ...payload }); setErr(null) }
-        catch (e) { setErr(String(e.message || e)) }
+        try {
+          // display 放 query：宿主侧以 query 为准（早先放 body 会被 undefined 覆盖 → 500）
+          await postJson(`/input?display=${encodeURIComponent(display)}`, payload)
+          setErr(null)
+        } catch (e) { setErr(String(e.message || e)) }
       }
       const onClickImage = (ev) => {
         const el = imgRef.current
@@ -180,6 +208,11 @@ window.__ModuleLoader__.load({
             : h('span', { style: S.chip }, display || '无'),
           h('button', { style: S.btnPrimary, disabled: busy, onClick: doStart }, busy ? '…' : '启动'),
           h('button', { style: S.btn, disabled: !display || busy, onClick: doStop }, '停止'),
+          h('button', {
+            style: visible ? S.btnPrimary : S.btn, disabled: !display || busy,
+            onClick: visible ? doPopin : togglePopout,
+            title: '默认纯后台运行，桌面上没有窗口；点这里才弹出一个真实窗口（关掉即回到静默）',
+          }, visible ? '关闭真实窗口' : '打开真实窗口'),
           h('button', { style: S.btn, disabled: !display, onClick: loadWins }, '窗口'),
         ),
 
@@ -191,7 +224,7 @@ window.__ModuleLoader__.load({
                 onLoad: (e) => setNatural({ w: e.target.naturalWidth, h: e.target.naturalHeight }),
               })
             : h('div', { style: { padding: 16, ...S.muted } },
-                display ? '正在获取画面…' : '还没有隔离 display，点「启动」。'),
+                display ? '正在获取画面…' : '还没有隔离 display，点「启动」。默认纯后台运行，桌面无窗口。'),
         ),
 
         err ? h('div', { style: S.err }, err) : null,

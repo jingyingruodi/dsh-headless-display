@@ -1,12 +1,17 @@
-# dsh-isolated-x11 —— 在隔离虚拟 X display（Xephyr）里驱动 GUI 程序。
+# dsh-headless-display —— 隔离的 headless 虚拟 X display。
 #
-# parentDisplay / xauthority 建议显式给出：dsh 宿主进程通常**不继承**桌面会话的
-# DISPLAY 与 XAUTHORITY（实测 host env 里两者都没有）。代码里有自动探测兜底，
-# 但显式配置最稳。
+# 默认 backend=xvfb：**桌面上不开任何窗口**，完全静默；
+# 需要看/亲手操作时用面板上的「打开真实窗口」（x11vnc + VNC 查看器），
+# 关掉即回到静默，程序不重启。
+# 想要旧的可见窗口行为，把 backend 改成 'xephyr' 即可。
+#
+# parentDisplay / xauthority 只在 backend=xephyr 时需要：dsh 宿主进程通常不继承
+# 桌面会话的 DISPLAY/XAUTHORITY（实测 host env 里两者都没有）。
 - insert:
     - id: gui-isolation
-      name: dsh-isolated-x11
+      name: dsh-headless-display
       config:
+        backend: xvfb
+        defaultSize: 1280x720
         parentDisplay: ':1'
         xauthority: /run/user/1000/xauth_ZALigT
-        defaultSize: 1280x720

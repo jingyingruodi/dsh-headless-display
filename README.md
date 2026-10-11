@@ -1,4 +1,4 @@
-# dsh-isolated-x11
+# dsh-headless-display
 
 在**隔离的虚拟 X display**（Xephyr）里运行并操作 GUI 程序 —— 不抢用户焦点、不占用桌面。
 给 Agent 提供 7 个工具，并在 DSH Web 界面里提供一个**可看可点的实时画面面板**。
@@ -25,6 +25,22 @@
 - [许可证](#许可证)
 
 ---
+
+## 两种后端：默认静默 / 按需弹窗
+
+| 后端 | 行为 | 适用 |
+|---|---|---|
+| **`xvfb`（默认）** | 真 headless，**桌面上完全没有任何窗口**，用户零感知；面板里照样能看能点 | 无人值守 / 不想被打扰 |
+| `xephyr` | 会在用户桌面上开一个窗口（旧的可见行为） | 想一边跑一边直接看真实窗口 |
+
+想看真实画面、想亲手操作时，**不必切换后端**：用面板上的
+**「打开真实窗口」**（或工具 `iso_display_popout`）。它在该 display 上启动
+**只监听本机回环**的 `x11vnc`，再用 VNC 查看器开一个窗口；关掉即回到静默，
+**里面的程序不用重启**。这与 `dsh-ego-browser`「浏览器静默跑、需要时弹出真实页」是同一个模型。
+
+> ⚠️ 已知限制：KDE **Wayland** 下，XWayland 窗口**抬不到原生 Wayland 窗口之上**，
+> 所以弹出的查看器窗口可能不会自动到最前 —— 可从任务栏点击它。
+> 这是平台行为，不是插件能绕过的。
 
 ## 为什么需要隔离 display
 
@@ -56,9 +72,14 @@
 ### 前置（Linux / X11 或 Wayland）
 
 ```bash
-sudo apt install xserver-xephyr x11-utils xdotool imagemagick
+# 默认（headless）后端所需
+sudo apt install xvfb x11-utils xdotool imagemagick
+# 「打开真实窗口」所需
+sudo apt install x11vnc gvncviewer
+# 想用可见窗口后端（backend: xephyr）再装：
+sudo apt install xserver-xephyr
 # 验证
-command -v Xephyr xdpyinfo xdotool import identify
+command -v Xvfb xdpyinfo xdotool import identify x11vnc gvncviewer
 ```
 
 - `Xephyr` —— 隔离 display 本体
@@ -77,7 +98,7 @@ plugin_manager(action: "install_bundle", target: "<本目录的绝对路径>")
 安装后确认：
 
 ```
-plugin_manager(action: "list_bundles")     # 应出现 dsh-isolated-x11，rows: gui-isolation
+plugin_manager(action: "list_bundles")     # 应出现 dsh-headless-display，rows: gui-isolation
 ```
 
 ### 验证
@@ -269,6 +290,8 @@ ctx.inject(['betterSidebar'], cb)
 | 画面靠轮询 | 约 0.9s 一帧。要更流畅可改成 WebSocket + MJPEG/VP8 流。 |
 | 无输入法/多指手势 | 只有 `xdotool` 能力范围内的键鼠。 |
 | 默认只监听回环 | 不要把 3080 暴露到公网。 |
+| 弹出窗口不一定到最前 | KDE Wayland 下 XWayland 窗口抬不过原生 Wayland 窗口（平台限制） |
+| `backend: xephyr` 会开窗口 | 会打扰用户；除非确实需要，否则保持默认 `xvfb` |
 
 ---
 
