@@ -1,6 +1,6 @@
 {
   "name": "dsh-isolated-x11",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "在隔离的虚拟 X display（Xephyr）里运行并操作 GUI 程序：7 个 Agent 工具 + 右侧栏实时画面面板，不抢焦点、不占桌面。",
@@ -16,7 +16,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "icon": "./icon.svg",
   "meta": {
@@ -31,5 +32,6 @@
       "platform": "web",
       "immediately": true
     }
-  }
+  },
+  "license": "MIT"
 }

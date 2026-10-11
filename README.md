@@ -22,6 +22,7 @@
 - [已知限制](#已知限制)
 - [部署到其他设备](#部署到其他设备)
 - [故障排查](#故障排查)
+- [许可证](#许可证)
 
 ---
 
@@ -239,6 +240,24 @@ function resolveConfig(runtime, config) {
 - 代码里有自动探测兜底：`$XAUTHORITY` → `/run/user/<uid>/xauth_*` → `~/.Xauthority`
 - 但**显式配置最稳**（见 `cordis.patch.yml` 的 `parentDisplay` / `xauthority`）
 
+### 4. 判断 `betterSidebar` 可用性**不能**用 `ctx.get()`
+
+better-sidebar 是通过 **`ctx.provide("betterSidebar", service)`** 发布服务的，
+它**晚于**本插件 apply。所以：
+
+```js
+// ❌ 错：此刻拿到 undefined，标签页永远不注册（表现为「右栏根本没有这个选项」）
+if (!ctx.get('betterSidebar')) return
+ctx.inject(['betterSidebar'], cb)
+
+// ✅ 对：Cordis 会等待依赖就绪；真的没有时回调不执行，自然没有任何 UI
+ctx.inject(['betterSidebar'], cb)
+```
+
+另外：`betterSidebar` **不在** Cordis 的 Service 目录里，
+`cordis_inspect_query(platform:"client", provider:"Service")` 查不到它 ——
+**别因为查不到就以为它不存在**。
+
 ---
 
 ## 已知限制
@@ -292,3 +311,9 @@ function resolveConfig(runtime, config) {
 | `cordis.patch.yml` | bundle patch（插入 `gui-isolation` 行 + 配置） |
 | `locale/{en,zh}.json` | 插件卡片标题与描述 |
 | `icon.svg` | 插件图标 |
+
+---
+
+## 许可证
+
+[MIT](LICENSE) © 2026 jingyingruodi
