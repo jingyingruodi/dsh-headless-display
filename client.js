@@ -221,23 +221,25 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       apply(ctx) {
-        let hasBetter = false
-        try { hasBetter = !!ctx.get('betterSidebar') } catch {}
-        if (hasBetter) {
-          ctx.inject(['betterSidebar'], (bctx) => {
-            bctx.effect(() => bctx.betterSidebar.registerTab({
-              id: 'gui-isolation',
-              title: '隔离显示',
-              component: Panel,
-            }))
-          })
-        } else {
-          // 没有 better-sidebar 时回退成浮动面板，保证任何 composition 都能看到画面
-          ctx.slots.inject('shell.overlay', () => ctx.slots.register(
-            { name: 'shell.overlay', id: 'gui-isolation', order: 60, label: '隔离显示' },
-            Panel,
-          ))
-        }
+        // ⚠️ 事故记录（2026-10-11）：这里原本在 `ctx.get('betterSidebar')` 为假时
+        //    回退到 `shell.overlay` 注册浮层面板。`shell.overlay` 是**贯穿整个窗口的浮层**，
+        //    而面板容器写了 height:'100%' + 不透明背景 —— 结果把整个 Web UI 盖死，
+        //    用户点不到任何东西，只能从外部远程窗口通知才回滚掉。
+        //
+        //    教训：**绝不要**把大尺寸组件挂到 frame-wide 浮层上；宁可没有 UI，
+        //    也不能挡住用户。现在只在 better-sidebar 可用时注册一个**右栏标签页**
+        //    （它渲染在侧栏内部，结构上不可能覆盖其它区域）；没有 better-sidebar
+        //    就只保留 Agent 工具与 HTTP API，不注册任何 UI。
+        const hasBetter = (() => { try { return !!ctx.get('betterSidebar') } catch { return false } })()
+        if (!hasBetter) return
+
+        ctx.inject(['betterSidebar'], (bctx) => {
+          bctx.effect(() => bctx.betterSidebar.registerTab({
+            id: 'gui-isolation',
+            title: '隔离显示',
+            component: Panel,
+          }))
+        })
       },
     }
   },
