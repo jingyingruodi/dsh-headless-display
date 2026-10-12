@@ -43,12 +43,24 @@
 
 ---
 
-## 两种后端：默认静默 / 按需弹窗
+## 三种后端：默认静默 / 按需弹窗
 
-| 后端 | 行为 | 适用 |
-|---|---|---|
-| **`xvfb`（默认）** | 真 headless，**桌面上完全没有任何窗口**，用户零感知；面板里照样能看能点 | 无人值守 / 不想被打扰 |
-| `xephyr` | 会在用户桌面上开一个窗口（旧的可见行为） | 想一边跑一边直接看真实窗口 |
+| 后端 | 桌面上有窗口 | **DRI3** | Vulkan | 适用 |
+|---|---|---|---|---|
+| **`sway`（auto 下的首选）** | 否 | **有** | **GPU（RADV 等）** | **Proton / DX12 / 3D 游戏**，也兼容 2D |
+| `xvfb` | 否 | 无 | 仅 lavapipe（CPU 软渲） | 2D / X11 程序，最轻量 |
+| `xephyr` | **是**（会打扰用户） | 无 | ✗ | 想一边跑一边直接看真实窗口 |
+
+**`backend: auto`（默认）**：探测到 `sway` 就用 `sway`，否则退回 `xvfb`。
+显式写 `sway` / `xvfb` / `xephyr` 可强制指定。
+
+> **为什么 3D 游戏必须用 `sway`**：Xvfb 与 Xephyr 都**不提供 DRI3**，
+> Vulkan 的 WSI 会打印
+> `No DRI3 support detected - required for presentation` 并退到 llvmpipe；
+> UE/Unity 的 3D 游戏往往直接崩（Desynced 在 Xvfb 下抛 `EXCEPTION_INT_DIVIDE_BY_ZERO`）。
+> `sway` 后端起一个 **私有 `XDG_RUNTIME_DIR`** 的 headless sway，它自带 **Xwayland** ——
+> Xwayland 提供 DRI3，Vulkan/GL 因而直通 GPU。
+> 它的 wayland socket 在私有 runtime dir 里，与用户桌面会话**完全不相干**。
 
 想看真实画面、想亲手操作时，**不必切换后端**：用面板上的
 **「打开真实窗口」**（或工具 `iso_display_popout`）。它在该 display 上启动
@@ -71,9 +83,9 @@
 
 **解法**：另起一个**独立的 X server**，自动化全部在它内部进行，与用户会话完全隔离。
 
-- **默认用 `Xvfb`**：它是**纯 headless** 的 —— 桌面上**一个窗口都没有**，用户零感知。
-- 需要看到真实画面时，再用「打开真实窗口」把它投到一个窗口里（见下）。
-- 也可以选 `Xephyr` 后端：它会在用户桌面上开一个普通窗口，内部同样是独立 X server。
+- **`auto`/`sway`（推荐）**：headless sway + Xwayland，**桌面零窗口**且**有 GPU**。
+- **`Xvfb`**：纯 headless、最轻，但**无 GPU**（3D 游戏跑不了）。
+- **`Xephyr`**：在用户桌面上开一个普通窗口，内部同样是独立 X server。
 
 在这个独立 display 里，XTEST / XSendEvent / 抓屏全部正常。
 
@@ -94,15 +106,25 @@
 ### 前置（Linux / X11 或 Wayland）
 
 ```bash
-# 默认（headless）后端所需
-sudo apt install xvfb x11-utils xdotool imagemagick
+# sway 后端（默认 auto 下首选；跑 3D / Proton 游戏必需）
+sudo apt install sway grim x11-utils xdotool imagemagick
+# 说明：sway 自带 Xwayland；grim 用于抓屏（Xwayland 下 import 取不到根窗口）
+
+# xvfb 后端（无 GPU 时的退路 / 纯 2D 自动化）
+sudo apt install xvfb
+
 # 「打开真实窗口」所需
 sudo apt install x11vnc gvncviewer
+
 # 想用可见窗口后端（backend: xephyr）再装：
 sudo apt install xserver-xephyr
+
 # 验证
-command -v Xvfb xdpyinfo xdotool import identify x11vnc gvncviewer
+command -v sway grim Xvfb Xwayland xdpyinfo xdotool import identify x11vnc gvncviewer
 ```
+
+> **sway 能跑但 GPU 不可用？** 确认当前用户在 `render` 组里（`id -nG | tr ' ' '\n' | grep render`）；
+> wlroots 的 headless 后端要打开 `/dev/dri/renderD*`。
 
 - `Xephyr` —— 隔离 display 本体
 - `xdpyinfo` —— 探活
@@ -134,20 +156,72 @@ iso_display_stop ":9"
 
 ---
 
+## 跑 Windows / DX 游戏（Proton / Steam 兼容套件）
+
+**已实测**：Desynced（Unreal 引擎、DX12、只有 Win64 二进制）在 `sway` 后端的隔离
+display 里**完整渲染、有声音、桌面上零窗口**。
+
+### 要点
+
+1. **必须用 `sway` 后端** —— Xvfb/Xephyr 无 DRI3，Vulkan 退到 llvmpipe，
+   UE 游戏直接抛 `EXCEPTION_INT_DIVIDE_BY_ZERO`。
+2. **绕开 Steam 客户端直接调 Proton** —— `steam -applaunch` 由 Steam 客户端进程
+   带着**它自己的**环境启动游戏，调用方设的 `DISPLAY` 传不进去。
+3. 用 `iso_display_run` + `setsid ... &`（该工具是同步的，GUI 程序必须后台化）。
+
+### 调用模板
+
+```bash
+cat > /tmp/run-with-proton.sh <<'EOF'
+#!/bin/bash
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam"
+# 该游戏在 Steam 里的 compatdata 前缀（Steam 通常已经建好）
+export STEAM_COMPAT_DATA_PATH="/path/to/SteamLibrary/steamapps/compatdata/<APPID>"
+export STEAM_COMPAT_INSTALL_PATH="/path/to/SteamLibrary/steamapps/common/<GAME>"
+export SteamAppId=<APPID>
+export SteamGameId=<APPID>
+PROTON="/path/to/SteamLibrary/steamapps/common/Proton - Experimental/proton"
+GAME="/path/to/.../Binaries/Win64/<GAME>.exe"
+exec "$PROTON" run "$GAME" "$@"
+EOF
+chmod +x /tmp/run-with-proton.sh
+```
+
+然后：
+
+```
+iso_display_start                                          → :2（backend: sway, gpu: true）
+iso_display_run ":2" sh ["-c", "setsid /tmp/run-with-proton.sh -log > /tmp/game.log 2>&1 &"]
+iso_display_capture ":2"                                   → 截图，确认渲染
+iso_display_stop ":2"
+```
+
+### 踩过的坑
+
+| 现象 | 原因 / 解法 |
+|---|---|
+| 抓屏全黑 / 报 `import: ... BadMatch` | Xwayland 下 `import -window root` 取不到根窗口。**插件已自动改用 `grim`** 抓 Wayland 输出；手工抓屏时记得给 `XDG_RUNTIME_DIR` + `WAYLAND_DISPLAY`，别只给 `DISPLAY` |
+| `steam -applaunch` 起在了桌面上 | 见上文第 2 点，改直接调 `proton` |
+| Proton 版本与前缀不匹配 | `compatdata/<APPID>/version` 记着建前缀用的版本（本机是 `11.0-100`）。用别的版本会触发前缀更新，慢但可用 |
+| 起不来但无报错 | 看 `/tmp/game.log`；`pgrep -x <GAME>.exe` 确认进程是否真的起来了 |
+
+---
+
 ## 配置
 
 在 `cordis.patch.yml` 的 `config` 里改（安装后也可在 DSH 的插件页配置）：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `backend` | `xvfb` | `xvfb`＝纯 headless（桌面零窗口）；`xephyr`＝在桌面上开可见窗口 |
+| `backend` | `auto` | `auto`＝有 `sway` 就用它、否则 `xvfb`；也可强制 `sway` / `xvfb` / `xephyr` |
 | `parentDisplay` | `$DISPLAY` 或 `:1` | 承载 Xephyr 窗口的桌面 display（**仅 `backend: xephyr` 需要**） |
-| `xauthority` | 自动探测 | X 授权文件 |
-| `defaultSize` | `1280x720` | 默认分辨率 |
-| `displayRange` | `[9, 20]` | 可用的 display 编号区间 |
+| `xauthority` | 自动探测 | X 授权文件（sway 后端的 Xwayland 用它**自己那份**，插件自动发现） |
+| `defaultSize` | `1280x720` | 默认分辨率（sway 后端同时作用于虚拟输出） |
+| `displayRange` | `[9, 20]` | 可用的 display 编号区间（**仅 xvfb/xephyr**；sway 的 display 号由 Xwayland 自己挑） |
 | `stateDir` | `~/.dsh-headless-display` | 记录已启动 display 的目录 |
+| `swayRunDirBase` | `/run/user/<uid>/dsh-iso` | sway 实例的私有 `XDG_RUNTIME_DIR` 前缀 |
 | `vncPortBase` | `5900` | 弹出真实窗口时 x11vnc 的起始端口（只监听回环） |
-| `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
+| `swayPath` / `grimPath` / `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
 
 > ⚠️ `parentDisplay` 与 `xauthority` **建议显式配置** —— 见下面第 3 个坑。
 
@@ -317,13 +391,15 @@ ctx.inject(['betterSidebar'], cb)
 
 | 限制 | 说明 |
 |---|---|
-| **跑不了 Vulkan / 3D 程序** | Xephyr **不提供 DRI3**。`vulkaninfo` 会报 *No DRI3 support detected - required for presentation*；UE 游戏启动即 `EXCEPTION_INT_DIVIDE_BY_ZERO`。2D / X11 程序完全可用。3D 需求请用 headless wlroots 或 gamescope。 |
+| **`xvfb` / `xephyr` 跑不了 Vulkan / 3D** | 两者都**不提供 DRI3**。`vulkaninfo` 会报 *No DRI3 support detected - required for presentation*，Vulkan 退到 llvmpipe；UE 游戏启动即 `EXCEPTION_INT_DIVIDE_BY_ZERO`。**3D / Proton 游戏请用 `sway` 后端**（有 DRI3，Vulkan 直通 GPU）。 |
 | `iso_display_run` 是同步的 | 跑不会退出的 GUI 程序会占满超时。用 `sh -c "setsid <程序> &"` 后台起。 |
 | 画面靠轮询 | 约 0.9s 一帧。要更流畅可改成 WebSocket + MJPEG/VP8 流。 |
 | 无输入法/多指手势 | 只有 `xdotool` 能力范围内的键鼠。 |
 | 默认只监听回环 | 不要把 3080 暴露到公网。 |
 | 弹出窗口不一定到最前 | KDE Wayland 下 XWayland 窗口抬不过原生 Wayland 窗口（平台限制） |
-| `backend: xephyr` 会开窗口 | 会打扰用户；除非确实需要，否则保持默认 `xvfb` |
+| `backend: xephyr` 会开窗口 | 会打扰用户；除非确实需要，否则保持默认 `auto` |
+| `sway` 启动慢于 xvfb | 要连起 wlroots + Xwayland 两个进程，首次约 3–6 秒（xvfb 约 1 秒）。换来的是 GPU。 |
+| `sway` 需要 `render` 组 | wlroots headless 要打开 `/dev/dri/renderD*`。不在组里会退到软件渲染（仍能跑，只是慢）。 |
 
 ---
 
@@ -352,7 +428,10 @@ ctx.inject(['betterSidebar'], cb)
 | `iso_display_start` 报「Xephyr 未能在 :N 上就绪」 | `parentDisplay` 或 `xauthority` 不对（见坑 3）；手动跑一次 `DISPLAY=:1 Xephyr :9 -screen 1280x720 -ac` 看报错 |
 | 抓屏是纯黑/纯色 | 该 display 里确实没有窗口；先用 `iso_display_run` 起个程序 |
 | 面板里没有画面 | 确认 display 存活（`iso_display_list`），以及 `/gui-isolation/state` 能返回 |
-| 3D 程序秒退 | Xephyr 无 DRI3（见「已知限制」） |
+| 3D 程序秒退 / 报 VKD3D 或 D3D 错误 | 该后端无 DRI3。**改用 `sway`**（见「已知限制」） |
+| `sway` 后端启动超时 | 手动验证：`WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 sway -c /dev/null`，看能否起来；再 `command -v Xwayland grim` |
+| `sway` 起得来但游戏报 Vulkan 找不到设备 | 检查 `id -nG` 是否含 `render`；`ls -l /dev/dri/renderD*` |
+| `grim` 报找不到 wayland socket | 抓屏必须带该实例的 `XDG_RUNTIME_DIR` + `WAYLAND_DISPLAY`（插件已自动处理；手工抓屏常忘） |
 | 页面看不到「隔离显示」标签 | 需要**刷新页面**；并确认 `dsh-better-sidebar` 已启用 |
 
 ---

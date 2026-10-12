@@ -8,21 +8,32 @@
 //   解法：用 Xephyr 在用户桌面上开一个窗口，**内部却是独立的 X server**。
 //   在那个 display 里，XTEST / XSendEvent / 抓屏全部正常，且与用户会话完全隔离。
 //
-// ── 已知边界 ───────────────────────────────────────────────────────────────
-//   Xephyr **不提供 DRI3**，因此**跑不了 Vulkan/3D 游戏**
-//   （`vulkaninfo` 会报 "No DRI3 support detected - required for presentation"，
-//    UE 启动即 EXCEPTION_INT_DIVIDE_BY_ZERO）。2D / X11 程序完全可用。
+// ── 三种后端与能力边界（实测） ─────────────────────────────────────────────
+//   后端       桌面上有窗口?   有 DRI3?   Vulkan           适合
+//   ---------  -------------  --------  ---------------  ------------------------
+//   xvfb       否             否        仅 lavapipe(CPU)  2D / X11，最轻
+//   xephyr     是（会打扰）    否        ✗                需要可见窗口时
+//   sway       否             **是**    **RADV 真 GPU**  **Proton/DXVK/VKD3D 游戏**
+//
+//   Xvfb/Xephyr 无 DRI3 时 `vkcube` 会打印
+//     "No DRI3 support detected - required for presentation"
+//   并自动退到 llvmpipe；UE 游戏则直接 EXCEPTION_INT_DIVIDE_BY_ZERO。
+//
+//   `sway` 后端的做法：起一个**私有** XDG_RUNTIME_DIR 的 sway
+//   （`WLR_BACKENDS=headless`），它自带 Xwayland —— Xwayland 提供 DRI3，
+//   Vulkan/GL 因而直通 GPU。sway 的 wayland socket 在私有 runtime dir 里，
+//   与用户桌面会话完全不相干。
 //
 // ── 本文件提供两件事 ───────────────────────────────────────────────────────
-//   1. 给 Agent 的 7 个工具（iso_display_*）
+//   1. 给 Agent 的 9 个工具（iso_display_*）
 //   2. 给浏览器 Web UI 的 HTTP 路由（/gui-isolation/*），供 client.js 的
 //      侧边栏标签页拉取画面、注入输入
 //
-// 后端目前只有 `xephyr`；接口按后端无关设计，将来可接 MaaFramework 等。
+// 接口按后端无关设计；新增后端只需在 start()/stop() 里加分支。
 
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawn, spawnSync } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -49,16 +60,43 @@ export function apply(ctx, config = {}) {
   const bin = {
     xephyr: config.xephyrPath || 'Xephyr',
     xvfb: config.xvfbPath || 'Xvfb',
+    sway: config.swayPath || 'sway',
     vnc: config.x11vncPath || 'x11vnc',
     viewer: config.viewerPath || 'gvncviewer',
     xdotool: config.xdotoolPath || 'xdotool',
     shot: config.importPath || 'import',
+    // sway 后端用它抓屏（import 在 Xwayland 上取不到根窗口）
+    grim: config.grimPath || 'grim',
   }
+  // 裸命令名不能直接用 existsSync 判断（它不是路径，永远 false）——
+  // 沿 PATH 解析成绝对路径，解析不到就是没装。
+  function which(cmd) {
+    if (!cmd) return null
+    if (cmd.includes('/')) return existsSync(cmd) ? cmd : null
+    for (const d of String(process.env.PATH || '').split(':')) {
+      if (!d) continue
+      const p = path.join(d, cmd)
+      if (existsSync(p)) return p
+    }
+    return null
+  }
+  const grimPath = which(bin.grim)
   // 默认后端 = **Xvfb（真 headless）**：桌面上**不开任何窗口**，完全静默。
   // 需要看/亲手操作真实画面时，用「打开真实窗口」按需启动 x11vnc + VNC 查看器；
   // 关掉查看器即回到静默，**应用不重启**（这正是 dsh-ego-browser 的模型）。
   // 想直接开可见窗口（旧行为）可把 backend 配成 'xephyr'。
-  const backend = config.backend || 'xvfb'
+  // 后端选择。'auto' = 有 sway 就用 sway（能跑 3D/Proton 游戏），否则退 xvfb。
+  const backendCfg = config.backend || 'auto'
+  const swayAvailable = (() => {
+    try {
+      const p = spawnSync(bin.sway, ['--version'], { stdio: 'ignore', timeout: 5000 })
+      return p.status === 0
+    } catch { return false }
+  })()
+  const backend = backendCfg === 'auto' ? (swayAvailable ? 'sway' : 'xvfb') : backendCfg
+  if (!['sway', 'xvfb', 'xephyr'].includes(backend)) {
+    throw new Error(`未知 backend: ${backend}（可选 sway / xvfb / xephyr / auto）`)
+  }
   const VNC_PORT_BASE = config.vncPortBase || 5900
   const parentDisplay = config.parentDisplay || process.env.DISPLAY || ':1'
 
@@ -82,11 +120,19 @@ export function apply(ctx, config = {}) {
   }
   const xauthority = detectXauthority()
 
-  const envFor = (display) => ({
-    ...process.env,
-    DISPLAY: display,
-    ...(xauthority ? { XAUTHORITY: xauthority } : {}),
-  })
+  // 每个 display 可能有**自己的** XAUTHORITY：sway 后端的 Xwayland 用的是
+  // 私有 XDG_RUNTIME_DIR 里的 auth 文件，跟桌面会话那个不是同一个。
+  // 该映射在 start 时填充，并在插件加载后从状态文件异步补回（DSH 重启后仍可用）。
+  const displayAuth = new Map()
+
+  const envFor = (display) => {
+    const auth = displayAuth.get(display) || xauthority
+    return {
+      ...process.env,
+      DISPLAY: display,
+      ...(auth ? { XAUTHORITY: auth } : {}),
+    }
+  }
 
   const stateFile = (display) => path.join(stateDir, `${String(display).replace(':', '')}.json`)
 
@@ -104,6 +150,22 @@ export function apply(ctx, config = {}) {
     try { process.kill(pid, 0); return true } catch { return false }
   }
 
+  // DSH 重启后本进程不认识既有 display，从状态文件把各自的 XAUTHORITY 补回。
+  // 不 await：apply() 是同步的，这里只是尽力而为地恢复。
+  void (async () => {
+    try {
+      if (!existsSync(stateDir)) return
+      for (const f of await readdir(stateDir)) {
+        if (!f.endsWith('.json')) continue
+        try {
+          const st = JSON.parse(await readFile(path.join(stateDir, f), 'utf8'))
+          const d = st?.display || (':' + f.replace(/\.json$/, ''))
+          if (st?.xauthority) displayAuth.set(d, st.xauthority)
+        } catch {}
+      }
+    } catch {}
+  })()
+
   async function listDisplays() {
     if (!existsSync(stateDir)) return []
     const names = (await readdir(stateDir)).filter((f) => f.endsWith('.json'))
@@ -120,7 +182,12 @@ export function apply(ctx, config = {}) {
       // ★ visible 不能只看「有没有记过 viewerPid」—— 查看器可能早已退出，
       //   那样 UI 会一直显示「关闭真实窗口」而实际什么都没有。
       const visible = isAlive && pidAlive(st?.viewerPid)
-      out.push({ display, alive: isAlive, size: st?.size, pid: st?.pid, backend: st?.backend, visible })
+      const backendOf = st?.backend || (isAlive ? 'external' : undefined)
+      out.push({
+        display, alive: isAlive, size: st?.size, pid: st?.pid, backend: backendOf, visible,
+        // sway 后端才有 DRI3 → Vulkan/GL 能直通 GPU
+        gpu: backendOf === 'sway' ? true : undefined,
+      })
     }
     return out.sort((a, b) => a.display.localeCompare(b.display, undefined, { numeric: true }))
   }
@@ -130,9 +197,121 @@ export function apply(ctx, config = {}) {
     return null
   }
 
+  // ── sway headless 后端 ────────────────────────────────────────────────────
+  // 目的：拿到一个**有 DRI3 的 X display**，让 Vulkan/GL 直通 GPU，
+  // 从而能跑 Proton + DXVK/VKD3D 的 Windows/DX 游戏，同时桌面上零窗口。
+  //
+  // 做法：给 sway 一个**私有 XDG_RUNTIME_DIR**（与用户桌面会话彻底隔离），
+  // 以 WLR_BACKENDS=headless 启动；sway 自带 Xwayland，Xwayland 提供 DRI3。
+  // display 号由 Xwayland 自己挑（sway 传 -displayfd），所以启动后**发现**它。
+  const swayRunBase = config.swayRunDirBase
+    || (typeof process.getuid === 'function' ? `/run/user/${process.getuid()}/dsh-iso` : path.join(os.tmpdir(), 'dsh-iso'))
+
+  function pickSwayIndex() {
+    for (let n = 1; n <= 20; n++) if (!existsSync(`${swayRunBase}-${n}`)) return n
+    return null
+  }
+
+  function xSockets() {
+    try { return new Set(readdirSync('/tmp/.X11-unix').filter((f) => /^X\d+$/.test(f))) }
+    catch { return new Set() }
+  }
+
+  // Xwayland 的 cmdline 形如：
+  //   /usr/bin/Xwayland :2 -auth /run/user/1000/dsh-iso-1/xauth_XXXX -listenfd 8 ...
+  // 从里面取出这个 display 专属的 XAUTHORITY。
+  async function findWaylandAuth(display) {
+    try {
+      const { stdout } = await run('pgrep', ['-a', '-x', 'Xwayland'])
+      for (const line of String(stdout).split('\n')) {
+        const m = line.match(/\bXwayland\s+(:\d+)\b[^\n]*?-auth\s+(\S+)/)
+        if (m && m[1] === display) return m[2]
+      }
+    } catch {}
+    return ''
+  }
+
+  async function startSway({ size = defaultSize } = {}) {
+    const idx = pickSwayIndex()
+    if (idx === null) throw new Error('sway 隔离实例已达上限（20 个）')
+    const runDir = `${swayRunBase}-${idx}`
+    await mkdir(runDir, { recursive: true, mode: 0o700 })
+    try { await chmod(runDir, 0o700) } catch {}
+
+    // 最小 sway 配置：headless 输出 + 明确启用 Xwayland
+    const [w, h] = String(size).split('x')
+    const confPath = path.join(stateDir, `sway-${idx}.conf`)
+    await writeFile(confPath, [
+      '# 由 dsh-headless-display 生成：headless 隔离 display',
+      `output HEADLESS-1 resolution ${w || 1280}x${h || 720}`,
+      'output * bg #000000 solid_color',
+      'xwayland enable',
+      '',
+    ].join('\n'))
+
+    const before = xSockets()
+    const env = {
+      ...process.env,
+      XDG_RUNTIME_DIR: runDir,
+      WAYLAND_DISPLAY: 'wayland-iso',
+      WLR_BACKENDS: 'headless',
+      WLR_LIBINPUT_NO_DEVICES: '1',
+      WLR_RENDERER_ALLOW_SOFTWARE: '1',
+      XDG_SESSION_TYPE: 'wayland',
+      XDG_CURRENT_DESKTOP: 'sway',
+    }
+    delete env.DISPLAY  // 别把用户桌面的 DISPLAY 传给 sway
+
+    const child = spawn(bin.sway, ['-c', confPath], { detached: true, stdio: 'ignore', env })
+    child.unref()
+
+    // Xwayland 需要鉴权，所以发现新 socket 后**先取到它自己的 auth**，再判断可用性
+    let target = ''
+    for (let i = 0; i < 60 && !target; i++) {
+      await sleep(500)
+      for (const f of xSockets()) {
+        if (before.has(f)) continue
+        const d = ':' + f.slice(1)
+        const a = await findWaylandAuth(d)
+        if (a) displayAuth.set(d, a)
+        if (await alive(d)) { target = d; break }
+      }
+      if (child.pid && !pidAlive(child.pid)) break
+    }
+
+    if (!target) {
+      try { process.kill(-child.pid, 'SIGKILL') } catch {}
+      try { await rm(runDir, { recursive: true, force: true }) } catch {}
+      throw new Error('sway 未能在 30 秒内提供可用的 Xwayland display（检查 sway / Xwayland 是否已安装）')
+    }
+
+    const auth = displayAuth.get(target) || ''
+    // sway 自己挑 wayland socket 名（通常 wayland-1），不是我们传的 WAYLAND_DISPLAY，
+    // 所以要看目录里实际出现了哪个 —— grim 抓屏要用它。
+    let waylandDisplay = ''
+    try {
+      waylandDisplay = (await readdir(runDir)).find((f) => f.startsWith('wayland-') && !f.endsWith('.lock')) || ''
+    } catch {}
+    const st = {
+      size, pid: child.pid, backend: 'sway', display: target, runDir, confPath,
+      ...(waylandDisplay ? { waylandDisplay } : {}),
+      ...(auth ? { xauthority: auth } : {}),
+      parentDisplay, startedAt: new Date().toISOString(),
+    }
+    await writeFile(stateFile(target), JSON.stringify(st, null, 2))
+    return {
+      display: target, size, pid: child.pid, backend: 'sway', visible: false,
+      runDir, ...(waylandDisplay ? { waylandDisplay } : {}),
+      ...(auth ? { xauthority: auth } : {}), gpu: true,
+      note: '该 display 有 DRI3，Vulkan/GL 直通 GPU，可跑 Proton/DXVK/VKD3D 游戏',
+    }
+  }
+
   // ── 启动 / 停止 ──────────────────────────────────────────────────────────
   async function start({ size = defaultSize, display } = {}) {
     await mkdir(stateDir, { recursive: true })
+    // sway 后端的 display 号由 Xwayland 决定，无法指定；其余后端按区间挑。
+    if (backend === 'sway') return startSway({ size })
     const target = display || pickDisplay()
     if (!target) throw new Error(`display 区间 ${rangeLo}-${rangeHi} 已用满`)
     if (await alive(target)) {
@@ -171,7 +350,12 @@ export function apply(ctx, config = {}) {
     if (!display) throw new Error('需要 display 参数')
     const st = await readState(display)
     let killed = false
-    if (st?.pid) { try { process.kill(st.pid, 'SIGTERM'); killed = true } catch {} }
+    if (st?.pid) {
+      // sway 后端：它以 detached 启动，是进程组组长 —— 杀整组才能把
+      // 它拉起的 Xwayland 一并收掉，否则会留下孤儿 X server。
+      if (st.backend === 'sway') { try { process.kill(-st.pid, 'SIGTERM'); killed = true } catch {} }
+      try { process.kill(st.pid, 'SIGTERM'); killed = true } catch {}
+    }
     // 按进程名精确匹配，避免「同名字符串出现在调用者命令行里」导致误杀
     try {
       const { stdout } = await run('pgrep', ['-x', 'Xephyr'])
@@ -186,6 +370,10 @@ export function apply(ctx, config = {}) {
     if (st?.viewerPid) { try { process.kill(st.viewerPid, 'SIGTERM') } catch {} }
     if (st?.vncPid) { try { process.kill(st.vncPid, 'SIGTERM') } catch {} }
     try { await run('pkill', ['-f', `x11vnc -display ${display} `]) } catch {}
+    // sway 的私有 XDG_RUNTIME_DIR（含其 wayland socket 与 xauth 文件）
+    if (st?.runDir) { try { await rm(st.runDir, { recursive: true, force: true }) } catch {} }
+    if (st?.confPath) { try { await rm(st.confPath, { force: true }) } catch {} }
+    displayAuth.delete(display)
     await rm(stateFile(display), { force: true })
     return { display, killed }
   }
@@ -265,10 +453,43 @@ export function apply(ctx, config = {}) {
   }
 
   // ── 观察 / 操作 ──────────────────────────────────────────────────────────
-  async function snapshotBuffer(display) {
+  // sway 后端的 display 是 **Xwayland**：`import -window root` 在 Xwayland 上取不到
+  // 根窗口（BadMatch / 空图）。所以走 Wayland 侧抓屏 —— grim 用 wlr-screencopy，
+  // 在 headless 后端上同样有效，抓到的就是那个虚拟输出。
+  async function waylandEnvFor(display) {
+    const st = await readState(display)
+    if (!st?.runDir) return null
+    return {
+      ...process.env,
+      XDG_RUNTIME_DIR: st.runDir,
+      ...(st.waylandDisplay ? { WAYLAND_DISPLAY: st.waylandDisplay } : {}),
+    }
+  }
+
+  // 统一抓屏：返回 { ok, via } 或抛错。via = 'grim' | 'import'
+  async function shotTo(display, { out } = {}) {
+    const wenv = await waylandEnvFor(display)
+    if (wenv && grimPath) {
+      const args = out ? [out] : ['-']
+      await run(grimPath, args, { timeout: 30000, env: wenv, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 })
+      return { via: 'grim', buffer: out ? null : undefined }
+    }
+    if (out) {
+      await run(bin.shot, ['-display', display, '-window', 'root', out], { timeout: 30000, env: envFor(display) })
+      return { via: 'import' }
+    }
     const { stdout } = await run(bin.shot, ['-display', display, '-window', 'root', 'png:-'], {
       timeout: 30000, env: envFor(display), encoding: 'buffer', maxBuffer: 32 * 1024 * 1024,
     })
+    return { via: 'import', buffer: stdout }
+  }
+
+  async function snapshotBuffer(display) {
+    const r = await shotTo(display)
+    if (r.buffer) return r.buffer
+    // grim 走文件路径分支时不会给 buffer；这里再取一次到 stdout
+    const wenv = await waylandEnvFor(display)
+    const { stdout } = await run(grimPath, ['-'], { timeout: 30000, env: wenv, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 })
     return stdout
   }
 
@@ -277,10 +498,10 @@ export function apply(ctx, config = {}) {
     if (!(await alive(display))) throw new Error(`${display} 不在运行`)
     const out = outPath || path.join(stateDir, `shot-${String(display).replace(':', '')}-${Date.now()}.png`)
     await mkdir(path.dirname(out), { recursive: true })
-    await run(bin.shot, ['-display', display, '-window', 'root', out], { timeout: 30000, env: envFor(display) })
+    const r = await shotTo(display, { out })
     let size = null
     try { const { stdout } = await run('identify', ['-format', '%wx%h', out], { timeout: 8000 }); size = stdout.trim() } catch {}
-    return { display, out, size }
+    return { display, out, size, via: r.via }
   }
 
   async function windows({ display } = {}) {
@@ -327,7 +548,12 @@ export function apply(ctx, config = {}) {
   const tools = [
     {
       name: 'iso_display_start',
-      description: '启动一个隔离的虚拟 X display（Xephyr）。它会以普通窗口形式出现在用户桌面上，但内部是独立 X server：在其中可以任意抓屏、注入键鼠，且不抢用户焦点、不影响用户会话。返回 display 标识供其它 iso_display_* 工具使用。注意：Xephyr 不提供 DRI3，无法运行 Vulkan/3D 程序。',
+      description: '启动一个隔离的 display，返回 display 标识供其它 iso_display_* 工具使用。'
+        + '后端由插件配置的 backend 决定（默认 auto：有 sway 用 sway，否则 xvfb）：'
+        + 'sway = 真 headless 且**有 DRI3**，Vulkan/GL 直通 GPU，**可跑 Proton/DXVK/VKD3D 的 Windows/DX 游戏**；'
+        + 'xvfb = 真 headless 但无 DRI3，Vulkan 只能落 lavapipe（CPU 软渲），适合 2D/X11；'
+        + 'xephyr = 会在用户桌面上开一个窗口（旧行为）。'
+        + '三者都与用户会话隔离：不抢焦点、可任意抓屏与注入键鼠。',
       parameters: { type: 'object', additionalProperties: false, properties: { size: { type: 'string', description: '分辨率，如 "1280x720"（默认取插件配置）。' }, display: { type: 'string', description: '指定 display 编号，如 ":9"；省略则自动挑选空闲的。' } } },
       output: output(okSchema),
       execute: guard(start),
