@@ -83,6 +83,12 @@ window.__ModuleLoader__.load({
         padding: '1px 6px', borderRadius: 999, fontSize: 11,
         background: 'var(--dsw-alias-bg-layer-2)', border: '1px solid var(--dsw-alias-border-l1)',
       },
+      // 有 GPU 的后端（sway）：用品牌色标出来 —— 这意味着能跑 3D / Proton 游戏
+      chipGpu: {
+        padding: '1px 6px', borderRadius: 999, fontSize: 11, fontWeight: 500,
+        color: 'var(--dsw-alias-bg-base)', background: 'var(--dsw-alias-brand-primary)',
+        border: '1px solid var(--dsw-alias-brand-primary)',
+      },
     }
 
     // ── 面板 ──────────────────────────────────────────────────────────────
@@ -195,16 +201,31 @@ window.__ModuleLoader__.load({
       const displays = (info?.displays || [])
       const alive = displays.filter((d) => d.alive)
 
+      // 当前 display 的能力标签。后端决定了上限：
+      //   sway          → 有 DRI3，Vulkan/GL 直通 GPU，可跑 Proton/DXVK/VKD3D 游戏
+      //   xvfb / xephyr → 无 DRI3，Vulkan 只能落 lavapipe（CPU 软渲），3D 游戏跑不了
+      const cur = alive.find((d) => d.display === display)
+      const backendLabel = cur
+        ? `${cur.backend || '?'}${cur.gpu ? ' · GPU' : ''}`
+        : ''
+      const backendTitle = cur?.gpu
+        ? '该后端有 DRI3，Vulkan/GL 直通 GPU，可跑 Proton/DXVK/VKD3D 的 Windows/DX 游戏'
+        : '该后端不提供 DRI3，Vulkan 只能落 lavapipe（CPU 软渲），3D / Proton 游戏跑不了'
+
       return h('div', { style: S.root },
         h('div', { style: S.row },
           h('span', { style: { fontWeight: 600 } }, '隔离显示'),
           h('span', { style: S.muted }, info?.parentDisplay ? `父 ${info.parentDisplay}` : ''),
+          backendLabel
+            ? h('span', { style: cur.gpu ? S.chipGpu : S.chip, title: backendTitle }, backendLabel)
+            : null,
         ),
 
         h('div', { style: S.row },
           alive.length > 1
             ? h('select', { style: S.select, value: display || '', onChange: (e) => setDisplay(e.target.value) },
-                alive.map((d) => h('option', { key: d.display, value: d.display }, `${d.display} ${d.size || ''}`)))
+                alive.map((d) => h('option', { key: d.display, value: d.display },
+                  `${d.display} ${d.size || ''} ${d.backend || ''}${d.gpu ? '·GPU' : ''}`.trim())))
             : h('span', { style: S.chip }, display || '无'),
           h('button', { style: S.btnPrimary, disabled: busy, onClick: doStart }, busy ? '…' : '启动'),
           h('button', { style: S.btn, disabled: !display || busy, onClick: doStop }, '停止'),
