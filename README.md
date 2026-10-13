@@ -4,7 +4,8 @@
 给 Agent 提供 **9 个工具**，并在 DSH Web 界面里提供一个**可看可点的实时画面面板**。
 
 - **默认后端 `Xvfb`（真 headless）**：桌面上不开任何窗口
-- 想看/想亲手操作时，用面板上的「打开真实窗口」按需弹出（`x11vnc` + VNC 查看器）
+- 想看/想亲手操作时，用面板上的「打开真实窗口」按需弹出
+  （`sway` 后端用 **`wayvnc`**，其余后端用 **`x11vnc`**；都只监听回环）
 - 可选后端 `Xephyr`：直接在用户桌面上开一个可见窗口（旧的可见行为）
 
 > 本插件由 `dsh-ego-browser` 与自建的 `tools/isolated_display.sh` 演进而来；
@@ -63,9 +64,31 @@
 > 它的 wayland socket 在私有 runtime dir 里，与用户桌面会话**完全不相干**。
 
 想看真实画面、想亲手操作时，**不必切换后端**：用面板上的
-**「打开真实窗口」**（或工具 `iso_display_popout`）。它在该 display 上启动
-**只监听本机回环**的 `x11vnc`，再用 VNC 查看器开一个窗口；关掉即回到静默，
-**里面的程序不用重启**。这与 `dsh-ego-browser`「浏览器静默跑、需要时弹出真实页」是同一个模型。
+**「打开真实窗口」**（或工具 `iso_display_popout`）。它只监听本机回环地起一个 VNC
+服务端，再用 VNC 查看器开一个窗口；关掉即回到静默，**里面的程序不用重启**。
+这与 `dsh-ego-browser`「浏览器静默跑、需要时弹出真实页」是同一个模型。
+
+> ⚠️ **服务端按后端分两种**，不能混用：
+> - `sway` → **`wayvnc`**（走 wlr-screencopy 读 Wayland 输出）
+> - `xvfb` / `xephyr` → **`x11vnc`**
+>
+> 原因是**硬限制**：sway 后端的 display 是 **Xwayland**，而 x11vnc 靠 `XGetImage`
+> 读根窗口，在 Xwayland 上必然 `BadMatch`：
+> ```
+> X Error of failed request:  BadMatch (invalid parameter attributes)
+>   Major opcode of failed request:  73 (X_GetImage)
+> ```
+> 插件会自动按后端选对的工具。
+
+#### 查看器的两套语法（都实测踩过）
+
+| 查看器 | 地址写法 | `-Shared` |
+|---|---|---|
+| **TigerVNC** `vncviewer` | `localhost::<端口>` ✅ | ✅ 认识 |
+| **GTK-VNC** `gvncviewer` | `localhost::<端口>` ❌ → 会被当成默认 **5900**，报「连接被拒绝」<br>`localhost:<display号>` ✅（display 号 = 端口 − `vncPortBase`） | ❌ 不认识 → 报「未知选项」直接退出 |
+
+插件按实际解析到的查看器自动选择地址与参数。默认查看器是 `gvncviewer`；
+想换成 TigerVNC 可把配置里的 `viewerPath` 设为 `vncviewer`。
 
 > ⚠️ 已知限制：KDE **Wayland** 下，XWayland 窗口**抬不到原生 Wayland 窗口之上**，
 > 所以弹出的查看器窗口可能不会自动到最前 —— 可从任务栏点击它。
@@ -114,13 +137,16 @@ sudo apt install sway grim x11-utils xdotool imagemagick
 sudo apt install xvfb
 
 # 「打开真实窗口」所需
-sudo apt install x11vnc gvncviewer
+#   x11vnc  —— xvfb / xephyr 后端
+#   wayvnc  —— sway 后端（它的 display 是 Xwayland，x11vnc 在此不可用）
+#   gvncviewer —— 实际的查看器窗口
+sudo apt install x11vnc wayvnc gvncviewer
 
 # 想用可见窗口后端（backend: xephyr）再装：
 sudo apt install xserver-xephyr
 
 # 验证
-command -v sway grim Xvfb Xwayland xdpyinfo xdotool import identify x11vnc gvncviewer
+command -v sway grim Xvfb Xwayland xdpyinfo xdotool import identify x11vnc wayvnc gvncviewer
 ```
 
 > **sway 能跑但 GPU 不可用？** 确认当前用户在 `render` 组里（`id -nG | tr ' ' '\n' | grep render`）；
@@ -220,8 +246,8 @@ iso_display_stop ":2"
 | `displayRange` | `[9, 20]` | 可用的 display 编号区间（**仅 xvfb/xephyr**；sway 的 display 号由 Xwayland 自己挑） |
 | `stateDir` | `~/.dsh-headless-display` | 记录已启动 display 的目录 |
 | `swayRunDirBase` | `/run/user/<uid>/dsh-iso` | sway 实例的私有 `XDG_RUNTIME_DIR` 前缀 |
-| `vncPortBase` | `5900` | 弹出真实窗口时 x11vnc 的起始端口（只监听回环） |
-| `swayPath` / `grimPath` / `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
+| `vncPortBase` | `5900` | 弹出真实窗口时 VNC 服务端的起始端口（只监听回环） |
+| `swayPath` / `grimPath` / `wayvncPath` / `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
 
 > ⚠️ `parentDisplay` 与 `xauthority` **建议显式配置** —— 见下面第 3 个坑。
 
@@ -400,6 +426,7 @@ ctx.inject(['betterSidebar'], cb)
 | `backend: xephyr` 会开窗口 | 会打扰用户；除非确实需要，否则保持默认 `auto` |
 | `sway` 启动慢于 xvfb | 要连起 wlroots + Xwayland 两个进程，首次约 3–6 秒（xvfb 约 1 秒）。换来的是 GPU。 |
 | `sway` 需要 `render` 组 | wlroots headless 要打开 `/dev/dri/renderD*`。不在组里会退到软件渲染（仍能跑，只是慢）。 |
+| **x11vnc 在 sway 后端不可用** | 硬限制：Xwayland 上 `XGetImage` 会 `BadMatch`。插件已自动改用 `wayvnc`；手工调试时别混用。 |
 
 ---
 
@@ -432,6 +459,8 @@ ctx.inject(['betterSidebar'], cb)
 | `sway` 后端启动超时 | 手动验证：`WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 sway -c /dev/null`，看能否起来；再 `command -v Xwayland grim` |
 | `sway` 起得来但游戏报 Vulkan 找不到设备 | 检查 `id -nG` 是否含 `render`；`ls -l /dev/dri/renderD*` |
 | `grim` 报找不到 wayland socket | 抓屏必须带该实例的 `XDG_RUNTIME_DIR` + `WAYLAND_DISPLAY`（插件已自动处理；手工抓屏常忘） |
+| x11vnc 报 `Wayland display server detected` 后退出 | 它靠**环境变量**判断会话类型，即使 `-display` 指向 Xwayland 也会拒绝。插件已剥掉 `WAYLAND_DISPLAY` / `XDG_SESSION_TYPE`；手工起 x11vnc 时同理 |
+| 真实窗口不出现，查看器瞬间退出 | 查看器有**两套不兼容的地址语法与选项**（见下），插件按实现自动选；手工调试时别混用 |
 | 页面看不到「隔离显示」标签 | 需要**刷新页面**；并确认 `dsh-better-sidebar` 已启用 |
 
 ---

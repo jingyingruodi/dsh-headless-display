@@ -67,6 +67,9 @@ export function apply(ctx, config = {}) {
     shot: config.importPath || 'import',
     // sway 后端用它抓屏（import 在 Xwayland 上取不到根窗口）
     grim: config.grimPath || 'grim',
+    // sway 后端的 display 是 Xwayland —— x11vnc 在此不可用（XGetImage 会 BadMatch），
+    // 「打开真实窗口」改用 wayvnc（读 Wayland 输出）。
+    wayvnc: config.wayvncPath || 'wayvnc',
   }
   // 裸命令名不能直接用 existsSync 判断（它不是路径，永远 false）——
   // 沿 PATH 解析成绝对路径，解析不到就是没装。
@@ -81,9 +84,15 @@ export function apply(ctx, config = {}) {
     return null
   }
   const grimPath = which(bin.grim)
-  // 默认后端 = **Xvfb（真 headless）**：桌面上**不开任何窗口**，完全静默。
-  // 需要看/亲手操作真实画面时，用「打开真实窗口」按需启动 x11vnc + VNC 查看器；
-  // 关掉查看器即回到静默，**应用不重启**（这正是 dsh-ego-browser 的模型）。
+  const wayvncPath = which(bin.wayvnc)
+  // 只有 TigerVNC 的 vncviewer 认识 -Shared；GTK-VNC 的 gvncviewer 不认识
+  // （注意 gvncviewer 也以 "vncviewer" 结尾，所以要锚定整个 basename）
+  const viewerPath = which(bin.viewer)
+  const viewerIsTigerVnc = viewerPath ? path.basename(viewerPath) === 'vncviewer' : false
+  // 后端默认 'auto'：有 sway 就用 sway（有 DRI3、能跑 3D/Proton 游戏），
+  // 否则退 xvfb。两者桌面上都**不开任何窗口**，完全静默。
+  // 需要看/亲手操作真实画面时，用「打开真实窗口」按需起 VNC 服务端 + 查看器
+  // （sway 后端用 wayvnc，其余用 x11vnc）；关掉查看器即回到静默，**应用不重启**。
   // 想直接开可见窗口（旧行为）可把 backend 配成 'xephyr'。
   // 后端选择。'auto' = 有 sway 就用 sway（能跑 3D/Proton 游戏），否则退 xvfb。
   const backendCfg = config.backend || 'auto'
@@ -126,12 +135,47 @@ export function apply(ctx, config = {}) {
   const displayAuth = new Map()
 
   const envFor = (display) => {
-    const auth = displayAuth.get(display) || xauthority
-    return {
-      ...process.env,
-      DISPLAY: display,
-      ...(auth ? { XAUTHORITY: auth } : {}),
+    const env = { ...process.env, DISPLAY: display }
+    if (displayAuth.has(display)) {
+      // 已经探明了这个 display 的鉴权方式：'' 表示它**不需要**鉴权
+      // （sway 的 Xwayland 常如此，它没带 -auth 参数）
+      const a = displayAuth.get(display)
+      if (a) env.XAUTHORITY = a
+      else delete env.XAUTHORITY
+    } else if (xauthority) {
+      env.XAUTHORITY = xauthority
     }
+    return env
+  }
+
+  // x11vnc 会**检测会话环境**：只要看到 Wayland 就拒绝服务
+  //   "Wayland display server detected. ... Exiting."
+  // 即使 -display 指向的是 Xwayland 也一样。所以必须剥掉这些变量，把它当纯 X11。
+  const x11EnvFor = (display) => {
+    const env = { ...envFor(display) }
+    delete env.WAYLAND_DISPLAY
+    delete env.XDG_SESSION_TYPE
+    delete env.XDG_CURRENT_DESKTOP
+    return env
+  }
+
+  // 探测某个 display 究竟用哪个 XAUTHORITY。返回：
+  //   '路径'  → 用这个文件
+  //   ''      → 不需要鉴权
+  //   null    → 都连不上（display 有问题）
+  async function resolveAuth(display) {
+    const fromCmd = await findWaylandAuth(display)
+    const cands = fromCmd ? [fromCmd, '', xauthority] : ['', xauthority]
+    for (const cand of cands) {
+      const env = { ...process.env, DISPLAY: display }
+      if (cand) env.XAUTHORITY = cand
+      else delete env.XAUTHORITY
+      try {
+        await run('xdpyinfo', ['-display', display], { timeout: 4000, env })
+        return cand
+      } catch {}
+    }
+    return null
   }
 
   const stateFile = (display) => path.join(stateDir, `${String(display).replace(':', '')}.json`)
@@ -160,7 +204,8 @@ export function apply(ctx, config = {}) {
         try {
           const st = JSON.parse(await readFile(path.join(stateDir, f), 'utf8'))
           const d = st?.display || (':' + f.replace(/\.json$/, ''))
-          if (st?.xauthority) displayAuth.set(d, st.xauthority)
+          // 注意：'' 是有意义的值（该 display 无需鉴权），所以判「键存在」而非真值
+          if (st && 'xauthority' in st) displayAuth.set(d, st.xauthority || '')
         } catch {}
       }
     } catch {}
@@ -272,9 +317,12 @@ export function apply(ctx, config = {}) {
       for (const f of xSockets()) {
         if (before.has(f)) continue
         const d = ':' + f.slice(1)
-        const a = await findWaylandAuth(d)
-        if (a) displayAuth.set(d, a)
-        if (await alive(d)) { target = d; break }
+        const a = await resolveAuth(d)
+        if (a !== null) {
+          displayAuth.set(d, a)          // '' 也要记：表示该 display 无需鉴权
+          target = d
+          break
+        }
       }
       if (child.pid && !pidAlive(child.pid)) break
     }
@@ -285,7 +333,7 @@ export function apply(ctx, config = {}) {
       throw new Error('sway 未能在 30 秒内提供可用的 Xwayland display（检查 sway / Xwayland 是否已安装）')
     }
 
-    const auth = displayAuth.get(target) || ''
+    const auth = displayAuth.get(target) ?? ''
     // sway 自己挑 wayland socket 名（通常 wayland-1），不是我们传的 WAYLAND_DISPLAY，
     // 所以要看目录里实际出现了哪个 —— grim 抓屏要用它。
     let waylandDisplay = ''
@@ -295,14 +343,14 @@ export function apply(ctx, config = {}) {
     const st = {
       size, pid: child.pid, backend: 'sway', display: target, runDir, confPath,
       ...(waylandDisplay ? { waylandDisplay } : {}),
-      ...(auth ? { xauthority: auth } : {}),
+      xauthority: auth,
       parentDisplay, startedAt: new Date().toISOString(),
     }
     await writeFile(stateFile(target), JSON.stringify(st, null, 2))
     return {
       display: target, size, pid: child.pid, backend: 'sway', visible: false,
       runDir, ...(waylandDisplay ? { waylandDisplay } : {}),
-      ...(auth ? { xauthority: auth } : {}), gpu: true,
+      xauthority: auth, gpu: true,
       note: '该 display 有 DRI3，Vulkan/GL 直通 GPU，可跑 Proton/DXVK/VKD3D 游戏',
     }
   }
@@ -393,29 +441,58 @@ export function apply(ctx, config = {}) {
     const st = (await readState(display)) || {}
     const port = vncPort(display)
 
-    // 1) x11vnc：只监听回环、无密码、允许多个查看器
+    // 1) 起一个只监听回环、无密码的 VNC 服务端。
+    //    ★ 两条完全不同的路径：
+    //      · sway 后端 → 该 display 是 **Xwayland**。x11vnc 靠 XGetImage 读根窗口，
+    //        在 Xwayland 上必然 BadMatch，**根本无法工作**；必须改用 wayvnc
+    //        （走 wlr-screencopy 读 Wayland 输出）。
+    //      · xvfb / xephyr → 真 X server，用 x11vnc。
+    const useWayvnc = st.backend === 'sway' && !!wayvncPath && !!st.runDir
     let vncPid = st.vncPid
     let vncUp = false
     if (vncPid) { try { process.kill(vncPid, 0); vncUp = true } catch {} }
     if (!vncUp) {
-      const vnc = spawn(bin.vnc, ['-display', display, '-rfbport', String(port), '-localhost',
-                                  '-nopw', '-forever', '-shared', '-quiet', '-noxdamage'], {
-        detached: true, stdio: 'ignore', env: { ...process.env },
-      })
+      const vnc = useWayvnc
+        ? spawn(wayvncPath, ['-r', '127.0.0.1', '-p', String(port)], {
+            detached: true, stdio: 'ignore',
+            env: {
+              ...process.env,
+              XDG_RUNTIME_DIR: st.runDir,
+              ...(st.waylandDisplay ? { WAYLAND_DISPLAY: st.waylandDisplay } : {}),
+            },
+          })
+        : spawn(bin.vnc, ['-display', display, '-rfbport', String(port), '-localhost',
+                          '-nopw', '-forever', '-shared', '-quiet', '-noxdamage'], {
+            detached: true, stdio: 'ignore', env: x11EnvFor(display),
+          })
       vnc.unref()
       vncPid = vnc.pid
       for (let i = 0; i < 25; i++) {
         await sleep(200)
         try { await run('bash', ['-c', `exec 3<>/dev/tcp/127.0.0.1/${port}`], { timeout: 1500 }); vncUp = true; break } catch {}
       }
-      if (!vncUp) throw new Error(`x11vnc 未能在端口 ${port} 就绪`)
+      if (!vncUp) {
+        throw new Error(useWayvnc
+          ? `wayvnc 未能在端口 ${port} 就绪（sway 后端的 display 是 Xwayland，x11vnc 在此不可用）`
+          : `x11vnc 未能在端口 ${port} 就绪`)
+      }
     }
 
     // 2) VNC 查看器：这就是用户看到的「真实窗口」
     //    ★ 必须 GDK_BACKEND=x11：GTK 查看器默认走 Wayland 原生窗口，
     //      那样既进不了 X11 窗口树、也无法被 xdotool 激活/抬升。
     //      强制 X11 后至少能在任务栏出现、可被脚本激活。
-    const viewer = spawn(bin.viewer, [`localhost::${port}`, '-Shared'], {
+    //    ★ 参数与**地址语法**都按查看器实现区分（两者实测都踩过）：
+    //      · TigerVNC `vncviewer`：认 `localhost::<端口>`，也认 `-Shared`
+    //      · GTK-VNC `gvncviewer`：只认 `localhost:<display号>`（端口-offset），
+    //        传 `::端口` 会被它当成默认 5900 → "连接被拒绝"，且它不认识 `-Shared`
+    //        （传了直接 "未知选项" 退出）。服务端本身已允许多客户端
+    //        （wayvnc 默认、x11vnc 带 -shared），所以不传 `-Shared` 没有副作用。
+    const vncAddr = viewerIsTigerVnc
+      ? `localhost::${port}`
+      : `localhost:${port - VNC_PORT_BASE}`
+    const viewerArgs = viewerIsTigerVnc ? [vncAddr, '-Shared'] : [vncAddr]
+    const viewer = spawn(bin.viewer, viewerArgs, {
       detached: true, stdio: 'ignore',
       env: { ...process.env, GDK_BACKEND: 'x11' },
     })
@@ -446,7 +523,12 @@ export function apply(ctx, config = {}) {
     if (!display) throw new Error('需要 display 参数')
     const st = (await readState(display)) || {}
     let closed = false
-    if (st.viewerPid) { try { process.kill(st.viewerPid, 'SIGTERM'); closed = true } catch {} }
+    // ESRCH 表示进程本来就已退出 —— 对「窗口是否已关掉」而言同样是成功了，
+    // 不能因为 kill 抛异常就报 closed:false（视图器启动失败时会这样）。
+    if (st.viewerPid) {
+      try { process.kill(st.viewerPid, 'SIGTERM'); closed = true }
+      catch (e) { closed = e?.code === 'ESRCH' }
+    }
     if (st.vncPid) { try { process.kill(st.vncPid, 'SIGTERM') } catch {} }
     await writeFile(stateFile(display), JSON.stringify({ ...st, vncPid: undefined, viewerPid: undefined }, null, 2))
     return { display, closed, visible: false }
