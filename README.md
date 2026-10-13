@@ -426,6 +426,7 @@ ctx.inject(['betterSidebar'], cb)
 | `backend: xephyr` 会开窗口 | 会打扰用户；除非确实需要，否则保持默认 `auto` |
 | `sway` 启动慢于 xvfb | 要连起 wlroots + Xwayland 两个进程，首次约 3–6 秒（xvfb 约 1 秒）。换来的是 GPU。 |
 | `sway` 需要 `render` 组 | wlroots headless 要打开 `/dev/dri/renderD*`。不在组里会退到软件渲染（仍能跑，只是慢）。 |
+| `sway` 序号上限 20 | 只有 sway 进程**仍然活着**的序号才算占用；异常退出留下的 runDir 会在下次启动时被复用并清理。 |
 | **x11vnc 在 sway 后端不可用** | 硬限制：Xwayland 上 `XGetImage` 会 `BadMatch`。插件已自动改用 `wayvnc`；手工调试时别混用。 |
 
 ---
@@ -457,6 +458,7 @@ ctx.inject(['betterSidebar'], cb)
 | 面板里没有画面 | 确认 display 存活（`iso_display_list`），以及 `/gui-isolation/state` 能返回 |
 | 3D 程序秒退 / 报 VKD3D 或 D3D 错误 | 该后端无 DRI3。**改用 `sway`**（见「已知限制」） |
 | `sway` 后端启动超时 | 手动验证：`WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 sway -c /dev/null`，看能否起来；再 `command -v Xwayland grim` |
+| **`sway` 崩溃（OOM / `kill -9`）后重启总是超时** | 被打断的 Xwayland 会留下**残留 socket 文件**（`/tmp/.X11-unix/X<n>`，无进程监听）。插件已改为按「**启动前是否活着**」而非「socket 文件是否新增」发现 display，并在复用序号时清掉残留 runDir —— 现已能自愈 |
 | `sway` 起得来但游戏报 Vulkan 找不到设备 | 检查 `id -nG` 是否含 `render`；`ls -l /dev/dri/renderD*` |
 | `grim` 报找不到 wayland socket | 抓屏必须带该实例的 `XDG_RUNTIME_DIR` + `WAYLAND_DISPLAY`（插件已自动处理；手工抓屏常忘） |
 | x11vnc 报 `Wayland display server detected` 后退出 | 它靠**环境变量**判断会话类型，即使 `-display` 指向 Xwayland 也会拒绝。插件已剥掉 `WAYLAND_DISPLAY` / `XDG_SESSION_TYPE`；手工起 x11vnc 时同理 |
