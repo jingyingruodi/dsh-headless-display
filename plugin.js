@@ -163,6 +163,20 @@ export function apply(ctx, config = {}) {
   //   '路径'  → 用这个文件
   //   ''      → 不需要鉴权
   //   null    → 都连不上（display 有问题）
+  // 只判断「这个 display 现在是否可用」，不关心鉴权方式（用于启动前快照）
+  async function probeAlive(display) {
+    for (const cand of ['', xauthority]) {
+      const env = { ...process.env, DISPLAY: display }
+      if (cand) env.XAUTHORITY = cand
+      else delete env.XAUTHORITY
+      try {
+        await run('xdpyinfo', ['-display', display], { timeout: 3000, env })
+        return true
+      } catch {}
+    }
+    return false
+  }
+
   async function resolveAuth(display) {
     const fromCmd = await findWaylandAuth(display)
     const cands = fromCmd ? [fromCmd, '', xauthority] : ['', xauthority]
@@ -253,7 +267,21 @@ export function apply(ctx, config = {}) {
     || (typeof process.getuid === 'function' ? `/run/user/${process.getuid()}/dsh-iso` : path.join(os.tmpdir(), 'dsh-iso'))
 
   function pickSwayIndex() {
-    for (let n = 1; n <= 20; n++) if (!existsSync(`${swayRunBase}-${n}`)) return n
+    for (let n = 1; n <= 20; n++) {
+      const dir = `${swayRunBase}-${n}`
+      if (!existsSync(dir)) return n
+      // ★ 自愈：目录还在、但里面那个 sway 已经不在了 —— 说明上次是异常退出
+      //   （OOM / kill -9）没走 stop，runDir 留了下来。直接复用这个序号，
+      //   否则崩溃累积到 20 次后插件就再也起不来。
+      //   sway 的 ipc socket 名里带自己的 pid：sway-ipc.<uid>.<pid>.sock
+      let alive_ = false
+      try {
+        const sock = readdirSync(dir).find((f) => f.startsWith('sway-ipc.'))
+        const m = sock && sock.match(/sway-ipc\.\d+\.(\d+)\.sock$/)
+        if (m && pidAlive(Number(m[1]))) alive_ = true
+      } catch {}
+      if (!alive_) return n
+    }
     return null
   }
 
@@ -280,6 +308,8 @@ export function apply(ctx, config = {}) {
     const idx = pickSwayIndex()
     if (idx === null) throw new Error('sway 隔离实例已达上限（20 个）')
     const runDir = `${swayRunBase}-${idx}`
+    // pickSwayIndex 可能复用一个「目录还在但 sway 已死」的序号，先清干净再用
+    try { await rm(runDir, { recursive: true, force: true }) } catch {}
     await mkdir(runDir, { recursive: true, mode: 0o700 })
     try { await chmod(runDir, 0o700) } catch {}
 
@@ -294,7 +324,15 @@ export function apply(ctx, config = {}) {
       '',
     ].join('\n'))
 
-    const before = xSockets()
+    // ★ 快照必须是「启动前**活着**的 display」，不能只看 socket 文件在不在：
+    //   被 kill -9 打断的 Xwayland 会留下**残留 socket 文件**（无进程监听），
+    //   新实例很可能复用同一个号 —— 那样按「文件名新增」判断就永远发现不了，
+    //   表现就是 start 一直等到超时。
+    const beforeLive = new Set()
+    for (const f of xSockets()) {
+      const d = ':' + f.slice(1)
+      if (await probeAlive(d)) { beforeLive.add(d); displayAuth.set(d, await resolveAuth(d) ?? '') }
+    }
     const env = {
       ...process.env,
       XDG_RUNTIME_DIR: runDir,
@@ -315,8 +353,8 @@ export function apply(ctx, config = {}) {
     for (let i = 0; i < 60 && !target; i++) {
       await sleep(500)
       for (const f of xSockets()) {
-        if (before.has(f)) continue
         const d = ':' + f.slice(1)
+        if (beforeLive.has(d)) continue          // 本来就在跑的，不是我们起的
         const a = await resolveAuth(d)
         if (a !== null) {
           displayAuth.set(d, a)          // '' 也要记：表示该 display 无需鉴权
