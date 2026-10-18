@@ -3,17 +3,17 @@
 # 默认 backend=auto：探测到 sway 就用 sway —— 它**有 DRI3**，Vulkan/GL 直通 GPU，
 # 能跑 Proton/DXVK/VKD3D 的 Windows/DX 游戏；否则退回 xvfb（纯 2D、最轻）。
 # 两者桌面上都**不开任何窗口**，完全静默。
-# 需要看/亲手操作时用面板上的「打开真实窗口」（x11vnc + VNC 查看器），
-# 关掉即回到静默，程序不重启。
-# 想固定后端就显式写 backend: sway | xvfb；想要旧的可见窗口行为写 'xephyr'。
+# 需要看/亲手操作时用面板上的「打开真实窗口」（sway 用 wayvnc，其余用 x11vnc），
+# 关掉即回到静默，程序不重启。想固定后端就显式写 backend: sway | xvfb；
+# 想要旧的可见窗口行为写 'xephyr'。
 #
-# parentDisplay / xauthority 只在 backend=xephyr 时需要：dsh 宿主进程通常不继承
-# 桌面会话的 DISPLAY/XAUTHORITY（实测 host env 里两者都没有）。
+# 刻意**不**写 parentDisplay / xauthority：两者都随机器与桌面会话变化
+# （/run/user/<uid>/xauth_XXXXXX 每次可能换名），硬编码过的路径一旦失效，
+# 旧版本甚至会把用户桌面的 display 误判成隔离 display。插件会自动探测；
+# 配置里写了但文件不存在时也会被忽略。
 - insert:
     - id: gui-isolation
       name: dsh-headless-display
       config:
         backend: auto
         defaultSize: 1280x720
-        parentDisplay: ':1'
-        xauthority: /run/user/1000/xauth_ZALigT

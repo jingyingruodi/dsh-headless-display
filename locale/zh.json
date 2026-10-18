@@ -1,1 +1,6 @@
-{ "meta": { "title": "隔离显示", "description": "在隔离的虚拟 X display（Xephyr）里运行并操作 GUI 程序，不抢焦点、不占桌面。适合无人值守的自动化测试。" } }
+{
+  "meta": {
+    "title": "隔离显示",
+    "description": "在隔离的虚拟 display（headless sway / Xvfb）里运行并操作 GUI 程序：桌面上零窗口、不抢焦点，适合无人值守的静默自动化；sway 后端有 DRI3，可跑 Proton/DX 游戏。"
+  }
+}

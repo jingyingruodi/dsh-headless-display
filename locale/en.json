@@ -1,1 +1,6 @@
-{ "meta": { "title": "Isolated Display", "description": "Run and drive GUI apps in an isolated virtual X display (Xephyr) that never steals your focus or covers your desktop." } }
+{
+  "meta": {
+    "title": "Isolated Display",
+    "description": "Run and drive GUI apps in an isolated virtual display (headless sway / Xvfb): zero windows on the user desktop, no focus stealing. The sway backend provides DRI3 for Proton/DX games."
+  }
+}

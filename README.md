@@ -1,7 +1,7 @@
 # dsh-headless-display
 
 在**隔离的虚拟 X display** 里运行并操作 GUI 程序 —— 默认**桌面上零窗口、零干扰**。
-给 Agent 提供 **9 个工具**，并在 DSH Web 界面里提供一个**可看可点的实时画面面板**。
+给 Agent 提供 **10 个工具**（含环境自检），并在 DSH Web 界面里提供一个**可看可点的实时画面面板**。
 
 - **默认后端 `Xvfb`（真 headless）**：桌面上不开任何窗口
 - 想看/想亲手操作时，用面板上的「打开真实窗口」按需弹出
@@ -29,6 +29,7 @@
 ## 目录
 
 - [为什么需要隔离 display](#为什么需要隔离-display)
+- [静默保证：用户桌面上为什么不会多出窗口](#静默保证用户桌面上为什么不会多出窗口)
 - [功能](#功能)
 - [安装](#安装)
 - [配置](#配置)
@@ -41,6 +42,59 @@
 - [部署到其他设备](#部署到其他设备)
 - [故障排查](#故障排查)
 - [许可证](#许可证)
+
+---
+
+## 静默保证：用户桌面上为什么不会多出窗口
+
+「静默」不是口号，而是**两个具体故障的反面** —— 都实测踩过，现在由代码硬保证。
+
+### ① 隔离 display 的编号不能靠「探活失败」来判定
+
+旧实现先记「启动前还活着的 display」，再抓新出现的 socket。它依赖 XAUTHORITY 探测成功，
+而 `xauthority` 配置在换机器 / 重启桌面后会失效（`xauth_XXXXXX` 每次可能换名）。
+一旦探活全失败，**用户桌面的 `:1` 就会被当成「新建的 display」**。
+实测后果：`iso_display_run` 返回的 `DISPLAY=:1`、`xdpyinfo` 报 **1920x1200（用户屏）**，
+命令全跑在用户桌面上。
+
+现在的判据是**进程归属**：sway 以 detached 启动、是进程组组长，Xwayland 由它拉起，
+所以只认 `pgid/ppid === sway.pid` 的那个 Xwayland；再叠两道安全网：
+
+- 绝不接受「启动前活着」或「等于桌面 display」的编号；
+- 所有**写操作**（run / capture / windows / input / popout）都要求该 display 有本插件的
+  状态文件 —— 外部 display 默认一律拒绝（`allowForeignDisplays: true` 可放开）。
+
+### ② 只删 `WAYLAND_DISPLAY` 不够
+
+libwayland 在 `WAYLAND_DISPLAY` 为空时**默认连 `$XDG_RUNTIME_DIR/wayland-0`** ——
+正是用户桌面的合成器。宿主进程的 env 里本来就有 `WAYLAND_DISPLAY=wayland-0`；
+只删掉它，GTK 仍会以 Wayland 客户端身份连上桌面（实测 `zenity` 进程的
+`/proc/<pid>/fd` 里出现 `memfd:wayland-cursor`）。
+
+所以 `iso_display_run` 起的子进程默认**显式钉到 X11**：
+
+```text
+GDK_BACKEND=x11
+QT_QPA_PLATFORM=xcb
+SDL_VIDEODRIVER=x11
+ELECTRON_OZONE_PLATFORM_HINT=x11
+XDG_SESSION_TYPE=x11
+（并清掉 WAYLAND_DISPLAY / XDG_CURRENT_DESKTOP）
+```
+
+X11 客户端由 Xwayland（sway 后端）或 Xvfb 承载，于是 `xdotool`（XTEST）/
+`xwininfo` / 逐窗口聚焦都能工作，窗口也不可能漏到桌面。
+
+> **要用 Wayland 原生客户端**（只有 Wayland 后端的程序）：配置
+> `exposeWaylandClients: true`，或给 `iso_display_run` 的 `env` 传**绝对路径**的
+> `WAYLAND_DISPLAY`（如 `/run/user/1000/dsh-iso-1/wayland-1`）。
+> 代价：xdotool 够不到那些 Wayland 窗口，键鼠注入会失效。
+
+### 验证方法（本仓库作者的实测做法）
+
+KDE 下用 KWin 脚本（`org.kde.kwin.Scripting`）每 2 秒采样一次窗口清单，
+跑完整套自动化后与基线做 diff；再用 `spectacle` 定时抓桌面截图旁证。
+**出现任何新窗口**（`iso_display_popout` 的查看器除外）就算静默失败。
 
 ---
 
@@ -116,10 +170,12 @@
 
 ## 功能
 
-- **9 个 Agent 工具**：启停隔离 display、在其中跑命令、抓屏、列窗口、注入键鼠、
-  以及按需弹出/收起真实窗口
+- **10 个 Agent 工具**：环境自检、启停隔离 display、在其中跑命令、抓屏、列窗口、
+  注入键鼠，以及按需弹出/收起真实窗口
 - **Web 侧边栏面板**：实时画面 + 点击操作 + 文本/按键注入 + 窗口列表 + 真实窗口开关
-- **宿主 HTTP API**：8 条 `/gui-isolation/*` 路由，面板与外部脚本都可用
+- **宿主 HTTP API**：9 条 `/gui-isolation/*` 路由，面板与外部脚本都可用
+- **跨发行版**：`iso_display_doctor` 按 Debian / Fedora / Arch 给安装命令；
+  路径全部自动探测，换机器不用手改配置
 - **零 npm 依赖**：纯 JS，无构建步骤
 
 ---
@@ -127,6 +183,10 @@
 ## 安装
 
 ### 前置（Linux / X11 或 Wayland）
+
+> **按发行版安装**：不用手抄下面的命令 —— 装好插件后先跑 `iso_display_doctor`，
+> 它会列出本机缺什么，并直接给出 `apt` / `dnf` / `pacman` 的可粘贴命令。
+> 下面以 Debian 系为例。
 
 ```bash
 # sway 后端（默认 auto 下首选；跑 3D / Proton 游戏必需）
@@ -195,31 +255,46 @@ display 里**完整渲染、有声音、桌面上零窗口**。
    带着**它自己的**环境启动游戏，调用方设的 `DISPLAY` 传不进去。
 3. 用 `iso_display_run` + `setsid ... &`（该工具是同步的，GUI 程序必须后台化）。
 
-### 调用模板
+### 一键启动：`scripts/run-proton.sh`
+
+**不要自己拼 `STEAM_COMPAT_*`** —— 库目录、前缀、Proton 版本因机器而异，
+手写模板最容易把 `DISPLAY` 漏在 Steam 客户端那一侧（于是游戏开到用户桌面上）。
 
 ```bash
-cat > /tmp/run-with-proton.sh <<'EOF'
-#!/bin/bash
-export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam"
-# 该游戏在 Steam 里的 compatdata 前缀（Steam 通常已经建好）
-export STEAM_COMPAT_DATA_PATH="/path/to/SteamLibrary/steamapps/compatdata/<APPID>"
-export STEAM_COMPAT_INSTALL_PATH="/path/to/SteamLibrary/steamapps/common/<GAME>"
-export SteamAppId=<APPID>
-export SteamGameId=<APPID>
-PROTON="/path/to/SteamLibrary/steamapps/common/Proton - Experimental/proton"
-GAME="/path/to/.../Binaries/Win64/<GAME>.exe"
-exec "$PROTON" run "$GAME" "$@"
-EOF
-chmod +x /tmp/run-with-proton.sh
+scripts/run-proton.sh --list 1450900     # 只打印探测结果，不启动
 ```
 
-然后：
-
+```text
+appid          : 1450900 (Desynced)
+library        : /media/user/F-DataShared/SteamLibrary
+install dir    : …/steamapps/common/Desynced
+compatdata     : …/steamapps/compatdata/1450900
+prefix version : 11.0-100
+proton         : …/common/Proton 11.0            ← 优先匹配前缀版本
+exe            : …/Desynced/Binaries/Win64/Desynced.exe
 ```
-iso_display_start                                          → :2（backend: sway, gpu: true）
-iso_display_run ":2" sh ["-c", "setsid /tmp/run-with-proton.sh -log > /tmp/game.log 2>&1 &"]
-iso_display_capture ":2"                                   → 截图，确认渲染
+
+它做的事：枚举 `libraryfolders.vdf` 里所有库 → 找 `appmanifest_<appid>.acf` →
+读 `compatdata/<appid>/version` 选**同版本** Proton（找不到才退 Experimental/Hotfix）
+→ 定位 exe（`<installdir>.exe` → `Binaries/Win64/*.exe`，排除 CrashReport/Launcher）
+→ 设 `STEAM_COMPAT_CLIENT_INSTALL_PATH / DATA_PATH / INSTALL_PATH / SteamAppId`
+→ `exec proton run <exe>`。
+
+在隔离 display 里启动（`iso_display_run` 是同步的，GUI 程序必须后台化）：
+
+```bash
+iso_display_start                                    # → :2（backend: sway, gpu: true）
+iso_display_run ":2" sh ["-c", "setsid /path/to/scripts/run-proton.sh 1450900 -log > /tmp/game.log 2>&1 &"]
+iso_display_capture ":2"                             # 截图确认渲染
 iso_display_stop ":2"
+```
+
+要给游戏加环境变量时，用工具的 `env` 参数即可（不必改脚本）：
+
+```json
+{"display": ":2", "command": "sh",
+ "args": ["-c", "setsid /path/to/scripts/run-proton.sh 1450900 &"],
+ "env": {"WINEDEBUG": "-all", "SteamAppId": "1450900"}}
 ```
 
 ### 踩过的坑
@@ -239,15 +314,17 @@ iso_display_stop ":2"
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `backend` | `auto` | `auto`＝有 `sway` 就用它、否则 `xvfb`；也可强制 `sway` / `xvfb` / `xephyr` |
+| `backend` | `auto` | `auto`＝有 `sway` 就用它、否则 `xvfb`；也可强制 `sway` / `xvfb` / `xephyr`。**sway 起不来时 auto 会自动回退 xvfb**，结果里带 `fallback` / `fallbackReason` |
 | `parentDisplay` | `$DISPLAY` 或 `:1` | 承载 Xephyr 窗口的桌面 display（**仅 `backend: xephyr` 需要**） |
-| `xauthority` | 自动探测 | X 授权文件（sway 后端的 Xwayland 用它**自己那份**，插件自动发现） |
+| `xauthority` | 自动探测 | X 授权文件。**配了但文件不存在会被忽略**并回退自动探测（`/run/user/<uid>/xauth_*` → `~/.Xauthority`） |
 | `defaultSize` | `1280x720` | 默认分辨率（sway 后端同时作用于虚拟输出） |
-| `displayRange` | `[9, 20]` | 可用的 display 编号区间（**仅 xvfb/xephyr**；sway 的 display 号由 Xwayland 自己挑） |
+| `displayRange` | `[9, 20]` | 可用编号区间（仅 xvfb/xephyr；sway 的编号由 Xwayland 自己挑）。残留 socket 会被清掉复用 |
 | `stateDir` | `~/.dsh-headless-display` | 记录已启动 display 的目录 |
-| `swayRunDirBase` | `/run/user/<uid>/dsh-iso` | sway 实例的私有 `XDG_RUNTIME_DIR` 前缀 |
-| `vncPortBase` | `5900` | 弹出真实窗口时 VNC 服务端的起始端口（只监听回环） |
-| `swayPath` / `grimPath` / `wayvncPath` / `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
+| `swayRunDirBase` | `/run/user/<uid>/dsh-iso` | sway 私有 `XDG_RUNTIME_DIR` 前缀；无 `/run/user` 时自动回退 `$XDG_RUNTIME_DIR`、`$TMPDIR` |
+| `vncPortBase` | `5900` | 弹出真实窗口时 VNC 的起始端口（只监听回环） |
+| `allowForeignDisplays` | `false` | 是否允许操作**不是本插件启动的** display。默认拒绝，防止误操作到用户桌面 |
+| `exposeWaylandClients` | `false` | 是否把该实例的 wayland socket 交给子进程。默认 `false`＝全部钉到 X11，`xdotool` 可用 |
+| `swayPath` / `grimPath` / `wayvncPath` / `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` / `xdpyinfoPath` / `xwininfoPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
 
 > ⚠️ `parentDisplay` 与 `xauthority` **建议显式配置** —— 见下面第 3 个坑。
 
@@ -257,13 +334,16 @@ iso_display_stop ":2"
 
 | 工具 | 参数 | 作用 |
 |---|---|---|
-| `iso_display_start` | `size?` `display?` | 启动隔离 display，返回 `{display, size, pid}` |
+| `iso_display_doctor` | — | **环境自检**：依赖 / GPU / 目录 / 桌面 X 会话；缺什么按发行版给安装命令 |
+| `iso_display_start` | `size?` `display?` `backend?` | 启动隔离 display，返回 `{display, size, pid, backend, gpu}`；`backend` 可按次覆盖 |
 | `iso_display_list` | — | 列出已知 display 及是否存活 |
-| `iso_display_stop` | `display` | 停止并清理状态记录 |
-| `iso_display_run` | `display` `command` `args?` `timeoutMs?` | 在该 display 里执行命令（**同步**，GUI 程序请用 `setsid ... &`） |
+| `iso_display_stop` | `display` | 停止并清理（杀进程组、清残留 socket/lock） |
+| `iso_display_run` | `display` `command` `args?` `timeoutMs?` `env?` | 在该 display 里执行命令（**同步**，GUI 请用 `setsid ... &`）；`env` 适合 Proton 游戏 |
 | `iso_display_capture` | `display` `outPath?` | 整屏截图，返回 PNG 路径与尺寸 |
 | `iso_display_windows` | `display` | 列顶层窗口 |
 | `iso_display_input` | `display` `kind` `key?` `text?` `x?` `y?` `window?` | 注入输入；`kind` ∈ `key type click focus` |
+| `iso_display_popout` | `display` | 弹出真实窗口（VNC + 查看器）—— 桌面上**唯一**会出现的窗口 |
+| `iso_display_popin` | `display` | 收起真实窗口，回到静默；display 里的程序不重启 |
 
 **`window` 参数很关键**：给出窗口 id 时 `key`/`type` 走 `XSendEvent` **定向投递，不依赖焦点**；
 不给则走 XTEST（依赖焦点，全屏程序自己会持有焦点时够用）。
@@ -276,6 +356,7 @@ iso_display_stop ":2"
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| `GET` | `/gui-isolation/doctor` | 自检结果（同 `iso_display_doctor`） |
 | `GET` | `/gui-isolation/state` | `{displays:[{display,alive,size,pid}], defaultSize, parentDisplay}` |
 | `GET` | `/gui-isolation/snapshot?display=:9` | `image/png` 整屏截图 |
 | `GET` | `/gui-isolation/windows?display=:9` | `{windows:[...]}` |
@@ -427,23 +508,36 @@ ctx.inject(['betterSidebar'], cb)
 | `sway` 启动慢于 xvfb | 要连起 wlroots + Xwayland 两个进程，首次约 3–6 秒（xvfb 约 1 秒）。换来的是 GPU。 |
 | `sway` 需要 `render` 组 | wlroots headless 要打开 `/dev/dri/renderD*`。不在组里会退到软件渲染（仍能跑，只是慢）。 |
 | `sway` 序号上限 20 | 只有 sway 进程**仍然活着**的序号才算占用；异常退出留下的 runDir 会在下次启动时被复用并清理。 |
+| **默认强制 X11** | 子进程被钉到 X11（`GDK_BACKEND` / `QT_QPA_PLATFORM` / `SDL_VIDEODRIVER` / `ELECTRON_OZONE_PLATFORM_HINT`）。只有 Wayland 后端的程序需要 `exposeWaylandClients: true`，但那时 `xdotool` 够不到它们的窗口。 |
+| **外部 display 默认不可操作** | 防止误伤用户桌面；确需操作请设 `allowForeignDisplays: true` |
 | **x11vnc 在 sway 后端不可用** | 硬限制：Xwayland 上 `XGetImage` 会 `BadMatch`。插件已自动改用 `wayvnc`；手工调试时别混用。 |
 
 ---
 
 ## 部署到其他设备
 
-1. **装前置**（见上）
-2. **取到本目录**（git clone 或拷贝）
-3. **改 `cordis.patch.yml`**：
-   - `parentDisplay` 改成目标机器的桌面 display（`echo $DISPLAY`）
-   - `xauthority` 改成目标机器的 X 授权文件（`ls /run/user/$(id -u)/xauth_*`）
-4. **安装**：`plugin_manager(action:"install_bundle", target:"<目标机上的绝对路径>")`
-5. **验证**：`iso_display_list` → `iso_display_start` → `iso_display_capture`
-6. 装了 `dsh-better-sidebar` 时，刷新页面应能在右栏看到「隔离显示」
+目标：换一台 Linux（Debian/Ubuntu、Fedora、Arch…）几分钟装好，**不用手改路径**。
 
-> 目标机没有 `Xephyr` 时，也可以退而使用自建的
-> `tools/isolated_display.sh`（功能等价、命令行驱动，不依赖 dsh 插件系统）。
+1. **取到本目录**（`git clone` 或拷贝）
+2. **安装**：`plugin_manager(action:"install_bundle", target:"<本目录绝对路径>")`
+3. **自检**：调用 `iso_display_doctor`
+   - `ok: true` → 直接 `iso_display_start`
+   - `missing` 非空 → 按返回的 `install` 一行命令装好
+   - `warnings` 里有 GPU / 查看器 / 桌面临接的提示
+4. **验证**：`iso_display_start` → `iso_display_run` 起个窗口 → `iso_display_capture`
+5. 装了 `dsh-better-sidebar` 时，刷新页面能在右栏看到「隔离显示」
+
+**不需要**再手改 `parentDisplay` / `xauthority`：
+
+- `parentDisplay` 默认取 `$DISPLAY`，拿不到时探活 `:1`
+- `xauthority` 自动扫描 `/run/user/<uid>/xauth_*` 与 `~/.Xauthority`；
+  配置里写过但文件不存在时**忽略并回退自动探测**
+  （旧版正是被过期路径坑到：探活全失败 → 把用户桌面的 `:1` 当成新建的隔离 display）
+- sway 私有 runtime 目录按 `/run/user/<uid>` → `$XDG_RUNTIME_DIR` → `$TMPDIR` 依次回退，
+  非 systemd 发行版也能用
+
+> 包名对应关系：Debian/Ubuntu、Fedora、Arch 给可直接粘贴的命令；
+> 其它发行版给通用包名清单（避免编错包名带偏）。
 
 ---
 
@@ -451,6 +545,10 @@ ctx.inject(['betterSidebar'], cb)
 
 | 现象 | 原因 / 处理 |
 |---|---|
+| `iso_display_start` 返回的 display 是 `:1` 之类、`iso_display_run` 里 `DISPLAY` 指向用户屏 | 旧版故障（`xauthority` 过期 → 误判）。v1.3.0 已改用进程组判定；若仍出现，先跑 `iso_display_doctor` 看 `x11.xauthority` |
+| 程序窗口跑到用户桌面上 | 用了 Wayland 原生客户端：默认已钉 X11；如果你设了 `exposeWaylandClients: true` 或 `env.WAYLAND_DISPLAY`，Wayland 窗口就会进隔离合成器，但**不会**到桌面。若真到桌面，检查是否直接用了 `steam -applaunch`（见 Proton 章节） |
+| 缺依赖但报错只有一句 `spawn ENOENT` | 跑 `iso_display_doctor`，`missing` + `install` 会告诉你要装什么 |
+| `sway` 起不来又不知道原因 | `iso_display_doctor` 看 `backends.sway` / `gpu` / `dirs`；再手工跑 `WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 sway -c /dev/null` |
 | 插件行 `fiberPhase: failed`，报 `...reading 'validate'` | 声明了 `Config` —— 删掉它（见坑 1） |
 | 改了代码但行为没变 | 模块缓存（见坑 2）—— 换包名或重启 dsh |
 | `iso_display_start` 报「Xephyr 未能在 :N 上就绪」 | `parentDisplay` 或 `xauthority` 不对（见坑 3）；手动跑一次 `DISPLAY=:1 Xephyr :9 -screen 1280x720 -ac` 看报错 |
@@ -470,12 +568,55 @@ ctx.inject(['betterSidebar'], cb)
 ## 文件
 
 | 文件 | 说明 |
-|---|---|
-| `plugin.js` | 宿主：9 个工具 + 8 条 HTTP 路由 |
+|---|---|---|
+| `plugin.js` | 宿主：10 个工具 + 9 条 HTTP 路由 |
 | `client.js` | 浏览器：右栏标签页（better-sidebar 缺失时不注册任何 UI） |
+| `scripts/run-proton.sh` | 在隔离 display 里用 Proton 跑 Steam 游戏（自动探测库/前缀/版本/exe） |
 | `cordis.patch.yml` | bundle patch（插入 `gui-isolation` 行 + 配置） |
 | `locale/{en,zh}.json` | 插件卡片标题与描述 |
 | `icon.svg` | 插件图标 |
+
+---
+
+## 更新日志
+
+### v1.3.0（静默硬保证 + 跨发行版 + Proton 辅助脚本）
+
+**修复（都会让窗口/命令落到用户桌面上）**
+
+- **display 归属判定改用进程组**：旧实现靠「启动前是否活着」找新 display，
+  `xauthority` 配置过期时会把用户桌面的 `:1` 当成隔离 display
+  （实测 `iso_display_run` 报 `DISPLAY=:1`、1920x1200）。现在只认
+  `pgid/ppid === sway.pid` 的 Xwayland，并加两道安全网。
+- **子进程钉到 X11**：只删 `WAYLAND_DISPLAY` 时 libwayland 会默认连
+  `$XDG_RUNTIME_DIR/wayland-0`（用户桌面）。现在显式设
+  `GDK_BACKEND=x11` / `QT_QPA_PLATFORM=xcb` / `SDL_VIDEODRIVER=x11` /
+  `ELECTRON_OZONE_PLATFORM_HINT=x11` / `XDG_SESSION_TYPE=x11`。
+  可用 `exposeWaylandClients: true` 或 `env` 里给绝对路径 socket 恢复 Wayland 客户端。
+- **`xauthority` 过期路径**：配置值不存在时忽略并回退自动探测。
+- **写操作只允许本插件启动的 display**（`allowForeignDisplays` 可放开）。
+- **`spawn` 缺 `error` 监听**：缺二进制时 `ENOENT` 会抛未捕获异常带崩 dsh，已修。
+- **wayvnc 参数**：`-r` 实为 `--render-cursor`、`-p` 实为 `--show-performance`，
+  端口只能走位置参数（0.9.1 实测）。旧写法只是「碰巧能用」，已改成明确写法并带重试。
+- **`stop()` 不再用 `pkill -f`**（会误杀命令行里含同样字符串的进程），
+  改按进程组 + 「进程名 + 参数前缀」精确收尾，并清理残留 socket/lock。
+
+**新增**
+
+- `iso_display_doctor` 工具 + `/gui-isolation/doctor` 路由：依赖 / GPU / DRI3 /
+  目录可写 / 桌面 X 会话自检，按 Debian/Fedora/Arch 给安装命令。
+- `iso_display_start` 支持按次指定 `backend`；`auto` 失败自动回退 `xvfb`。
+- `iso_display_run` 支持 `env`（Proton 环境变量），并校验 `DISPLAY` /
+  `WAYLAND_DISPLAY` 不能指回用户桌面。
+- `scripts/run-proton.sh`：自动探测 Steam 库 / compatdata / Proton 版本 / exe。
+- runDir 在无 `/run/user/<uid>` 时回退 `$XDG_RUNTIME_DIR` / `$TMPDIR`。
+- `pickDisplay()` 自愈：残留 socket + lock 会被清掉复用编号。
+
+**改进**
+
+- `sway --version` 探测改为懒执行（不再阻塞 dsh 启动最多 5 秒）。
+- `snapshotBuffer()` 不再对 sway 后端抓两次屏。
+- `listDisplays()` 的状态文件恢复改为同步读取（重启后立刻可用 `WAYLAND_DISPLAY`）。
 
 ---
 
