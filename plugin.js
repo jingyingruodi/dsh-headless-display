@@ -240,6 +240,28 @@ export function apply(ctx, config = {}) {
 
   const stateFile = (display) => path.join(stateDir, `${String(display).replace(':', '')}.json`)
 
+  // display / size 的写法归一化。工具调用方（模型）经常写 "9"、":9.0"、" :9 "，
+  // 旧实现会原样拼进 DISPLAY="9" → X 连不上但没人报错；这里统一成 ":9"。
+  function normDisplay(d) {
+    if (typeof d !== 'string' || !d.trim()) throw new Error('需要 display 参数（字符串，如 ":9"，由 iso_display_start 返回）')
+    const m = d.trim().match(/^:?(\d+)(?:\.\d+)?$/)
+    if (!m) throw new Error(`display 写法不对：${JSON.stringify(d)}（应形如 ":9" 或 "9"）`)
+    return ':' + m[1]
+  }
+  function normSize(size, fallback) {
+    const v = String(size ?? fallback ?? '')
+    if (!/^\d+x\d+$/.test(v)) throw new Error(`size 写法不对：${JSON.stringify(size ?? fallback)}（应形如 "1280x720"）`)
+    return v
+  }
+  // 串行化 start/stop：两个工具调用并发时，编号挑选 + 状态写入会互相覆盖
+  // （实测：并发 start 导致两个实例抢同一个 display 号、状态文件被覆盖成孤儿进程）。
+  let opChain = Promise.resolve()
+  function serialized(fn) {
+    const p = opChain.then(fn, fn)
+    opChain = p.then(() => {}, () => {})
+    return p
+  }
+
   async function readState(display) {
     try { return JSON.parse(await readFile(stateFile(display), 'utf8')) } catch { return null }
   }
@@ -249,7 +271,9 @@ export function apply(ctx, config = {}) {
   async function ensureOwned(display) {
     const st = await readState(display)
     if (!st && !allowForeignDisplays) {
-      throw new Error(`${display} 不是本插件启动的 display（可能是用户桌面）。为避免干扰用户已拒绝操作；确需操作外部 display，请把插件配置 allowForeignDisplays 设为 true。`)
+      throw new Error(await alive(display)
+        ? `${display} 不是本插件启动的 display（可能是用户桌面），已拒绝操作以免干扰用户；确需操作外部 display 请把配置 allowForeignDisplays 设为 true。`
+        : `${display} 没有本插件的状态记录（可能已停止、编号写错，或不是本插件启动的），已拒绝操作。`)
     }
     return st
   }
@@ -299,11 +323,15 @@ export function apply(ctx, config = {}) {
       //   那样 UI 会一直显示「关闭真实窗口」而实际什么都没有。
       const visible = isAlive && pidAlive(st?.viewerPid)
       const backendOf = st?.backend || (isAlive ? 'external' : undefined)
-      out.push({
-        display, alive: isAlive, size: st?.size, pid: st?.pid, backend: backendOf, visible,
-        // sway 后端才有 DRI3 → Vulkan/GL 能直通 GPU
-        gpu: backendOf === 'sway' ? true : undefined,
-      })
+      // ★ 不能把 undefined 塞进对象：工具输出的 JSON 校验会报
+      //   "value is not lossless JSON"（实测：只要存在一条 xvfb 记录，list 就整个失败）。
+      const item = { display, alive: isAlive, visible }
+      for (const [k, v] of [['size', st?.size], ['pid', st?.pid], ['backend', backendOf]]) {
+        if (v !== undefined) item[k] = v
+      }
+      // sway 后端才有 DRI3 → Vulkan/GL 能直通 GPU
+      if (backendOf === 'sway') item.gpu = true
+      out.push(item)
     }
     return out.sort((a, b) => a.display.localeCompare(b.display, undefined, { numeric: true }))
   }
@@ -391,6 +419,15 @@ export function apply(ctx, config = {}) {
     if (missing.length) {
       throw new Error(`缺少可执行文件：${missing.join('、')}。先跑 iso_display_doctor 看本机的安装命令。`)
     }
+  }
+
+  // /tmp/.X<n>-lock 的内容是持有该 display 的 X server pid（Xvfb/Xephyr/Xwayland 都写）
+  async function lockOwner(display) {
+    try {
+      const t = (await readFile(`/tmp/.X${String(display).replace(':', '')}-lock`, 'utf8')).trim()
+      const n = Number(t)
+      return Number.isFinite(n) && n > 0 ? n : null
+    } catch { return null }
   }
 
   async function procField(pid, field) {
@@ -537,6 +574,8 @@ export function apply(ctx, config = {}) {
   // ── 启动 / 停止 ──────────────────────────────────────────────────────────
   // 单个后端的启动实现。拆出来是为了让 backend=auto 能在 sway 失败时回退 xvfb。
   async function startBackend(whichBackend, { size = defaultSize, display } = {}) {
+    size = normSize(size, defaultSize)
+    if (display !== undefined && display !== null && display !== '') display = normDisplay(display)
     // sway 后端的 display 号由 Xwayland 决定，无法指定；其余后端按区间挑。
     if (whichBackend === 'sway') return startSway({ size })
     const binName = whichBackend === 'xephyr' ? bin.xephyr : bin.xvfb
@@ -565,6 +604,14 @@ export function apply(ctx, config = {}) {
     for (let i = 0; i < 30; i++) {
       await sleep(400)
       if (await alive(target)) {
+        // ★ 校验编号归属：并发 start / 残留锁时，可能「连上的是别人的 X server」。
+        //   锁文件里的 pid 必须是本次拉起的子进程，否则宁可失败也不写状态。
+        const owner = await lockOwner(target)
+        if (owner && owner !== child.pid) {
+          try { process.kill(-child.pid, 'SIGKILL') } catch {}
+          try { process.kill(child.pid, 'SIGKILL') } catch {}
+          throw new Error(`${target} 的 X 锁属于 pid ${owner}，不是本次启动的 ${child.pid} —— 编号被并发占用，请重试`)
+        }
         const st = { size, pid: child.pid, backend: whichBackend, parentDisplay, startedAt: new Date().toISOString() }
         await writeFile(stateFile(target), JSON.stringify(st, null, 2))
         return { display: target, size, pid: child.pid, backend: whichBackend, visible: whichBackend === 'xephyr', parentDisplay, silent: whichBackend !== 'xephyr' }
@@ -576,6 +623,8 @@ export function apply(ctx, config = {}) {
   }
 
   async function start({ size = defaultSize, display, backend: reqBackend } = {}) {
+    size = normSize(size, defaultSize)
+    if (display !== undefined && display !== null && display !== '') display = normDisplay(display)
     await mkdir(stateDir, { recursive: true })
     const want = reqBackend || backendCfg
     if (!['sway', 'xvfb', 'xephyr', 'auto'].includes(want)) {
@@ -612,8 +661,13 @@ export function apply(ctx, config = {}) {
   }
 
   async function stop({ display } = {}) {
-    if (!display) throw new Error('需要 display 参数')
+    display = normDisplay(display)
     const st = await readState(display)
+    if (!st) {
+      throw new Error(await alive(display)
+        ? `${display} 不是本插件启动的 display（可能是用户桌面），拒绝停止`
+        : `${display} 没有本插件的状态记录（可能已经停止，或编号写错）`)
+    }
     let killed = false
     // 先收「真实窗口」一侧，避免查看器还连着 VNC 时先杀掉服务端
     for (const pid of [st?.viewerPid, st?.vncPid]) {
@@ -658,7 +712,7 @@ export function apply(ctx, config = {}) {
   }
 
   async function popout({ display } = {}) {
-    if (!display) throw new Error('需要 display 参数')
+    display = normDisplay(display)
     const st = (await ensureOwned(display)) || {}
     if (!(await alive(display))) throw new Error(`${display} 不在运行`)
     const port = vncPort(display)
@@ -761,7 +815,7 @@ export function apply(ctx, config = {}) {
   }
 
   async function popin({ display } = {}) {
-    if (!display) throw new Error('需要 display 参数')
+    display = normDisplay(display)
     const st = (await ensureOwned(display)) || {}
     let closed = false
     // ESRCH 表示进程本来就已退出 —— 对「窗口是否已关掉」而言同样是成功了，
@@ -819,26 +873,37 @@ export function apply(ctx, config = {}) {
   }
 
   async function capture({ display, outPath } = {}) {
-    if (!display) throw new Error('需要 display 参数')
+    display = normDisplay(display)
     await ensureOwned(display)
     if (!(await alive(display))) throw new Error(`${display} 不在运行`)
     const out = outPath || path.join(stateDir, `shot-${String(display).replace(':', '')}-${Date.now()}.png`)
     await mkdir(path.dirname(out), { recursive: true })
     const r = await shotTo(display, { out })
     let size = null
-    try { const { stdout } = await run('identify', ['-format', '%wx%h', out], { timeout: 8000 }); size = stdout.trim() } catch {}
-    return { display, out, size, via: r.via }
+    let colors = null
+    try {
+      const { stdout } = await run('identify', ['-format', '%wx%h %k', out], { timeout: 8000 })
+      const parts = stdout.trim().split(/\s+/)
+      size = parts[0]
+      colors = Number(parts[1])
+    } catch {}
+    const rec = { display, out, size, via: r.via }
+    if (Number.isFinite(colors)) {
+      rec.colors = colors
+      if (colors <= 1) rec.note = '整屏只有一种颜色：display 里可能没有窗口；若明明有窗口却全黑，说明抓屏与 X 客户端不在同一显示上'
+    }
+    return rec
   }
 
   async function windows({ display } = {}) {
-    if (!display) throw new Error('需要 display 参数')
+    display = normDisplay(display)
     await ensureOwned(display)
     const { stdout } = await run(bin.xwininfo, ['-display', display, '-root', '-children'], { timeout: 8000, env: envFor(display) })
     return stdout.split('\n').filter((l) => /0x[0-9a-f]+ /.test(l)).map((l) => l.trim())
   }
 
   async function input({ display, kind, key, text: txt, x, y, window: wid } = {}) {
-    if (!display) throw new Error('需要 display 参数')
+    display = normDisplay(display)
     if (!kind) throw new Error('需要 kind 参数（key | type | click | focus）')
     await ensureOwned(display)
     const e = envFor(display)
@@ -854,7 +919,7 @@ export function apply(ctx, config = {}) {
   }
 
   async function runCommand({ display, command, args = [], timeoutMs = 60000, env: extraEnv } = {}) {
-    if (!display) throw new Error('需要 display 参数')
+    display = normDisplay(display)
     if (!command) throw new Error('需要 command 参数')
     await ensureOwned(display)
     const env = envFor(display)
@@ -866,8 +931,14 @@ export function apply(ctx, config = {}) {
         if (k === 'DISPLAY' && String(v) !== display) {
           throw new Error(`env.DISPLAY 只能是本 display（${display}），收到 ${v}`)
         }
-        if (k === 'WAYLAND_DISPLAY' && !String(v).includes('/')) {
-          throw new Error('env.WAYLAND_DISPLAY 只接受隔离实例 socket 的绝对路径（含 "/"），裸名字可能指向用户桌面')
+        if (k === 'WAYLAND_DISPLAY') {
+          // 只放行**本实例**的 socket：$XDG_RUNTIME_DIR/wayland-0 是用户桌面的合成器，
+          // 放过去等于给隔离客户端开了通往用户会话的口子（黑盒测试抓到过）。
+          const wst = await readState(display)
+          const wl = String(v)
+          if (!wst?.runDir || !wl.startsWith(wst.runDir + '/')) {
+            throw new Error(`env.WAYLAND_DISPLAY 只接受本隔离实例 socket 的绝对路径（例如 ${wst?.runDir ? `${wst.runDir}/wayland-1` : '/run/user/1000/dsh-iso-1/wayland-1'}），收到 ${wl}`)
+          }
         }
         env[k] = String(v)
       }
@@ -876,7 +947,16 @@ export function apply(ctx, config = {}) {
       const { stdout, stderr } = await run(command, args, { timeout: timeoutMs, env, maxBuffer: 4 * 1024 * 1024 })
       return { display, command, exitCode: 0, stdout: stdout.slice(-8000), stderr: stderr.slice(-4000) }
     } catch (e) {
-      return { display, command, exitCode: e.code ?? -1, stdout: (e.stdout || '').toString().slice(-8000), stderr: (e.stderr || e.message || '').toString().slice(-4000) }
+      // e.code 可能是数字（退出码）或字符串（'ENOENT' 等 spawn 错误）。
+      // 统一 exitCode 为数字，原始值另放 errorCode —— 否则调用方按类型判断会踩空。
+      const code = typeof e.code === 'number' ? e.code : -1
+      const rec = {
+        display, command, exitCode: code,
+        stdout: (e.stdout || '').toString().slice(-8000),
+        stderr: (e.stderr || e.message || '').toString().slice(-4000),
+      }
+      if (typeof e.code === 'string') rec.errorCode = e.code
+      return rec
     }
   }
 
@@ -1092,7 +1172,7 @@ export function apply(ctx, config = {}) {
         },
       },
       output: output(okSchema),
-      execute: guard(start),
+      execute: guard((a) => serialized(() => start(a))),
     },
     {
       name: 'iso_display_list',
@@ -1106,7 +1186,7 @@ export function apply(ctx, config = {}) {
       description: '停止指定的隔离 display 并清理其状态记录。',
       parameters: { type: 'object', additionalProperties: false, required: ['display'], properties: { display: D } },
       output: output(okSchema),
-      execute: guard(stop),
+      execute: guard((a) => serialized(() => stop(a))),
     },
     {
       name: 'iso_display_run',
@@ -1216,11 +1296,13 @@ export function apply(ctx, config = {}) {
         case 'GET windows':
           if (!display) return sendJson(res, 400, { error: 'display required' })
           return sendJson(res, 200, { windows: await windows({ display }) })
-        case 'POST start':
-          return sendJson(res, 200, await start(await readBody(req)))
+        case 'POST start': {
+          const body = await readBody(req)
+          return sendJson(res, 200, await serialized(() => start(body)))
+        }
         case 'POST stop': {
           const body = await readBody(req)
-          return sendJson(res, 200, await stop({ display: display || body.display }))
+          return sendJson(res, 200, await serialized(() => stop({ display: display || body.display })))
         }
         case 'POST input': {
           // 注意：query 的 display 只在**存在时**才覆盖 body —— 之前写成 `{ ...body, display }`
