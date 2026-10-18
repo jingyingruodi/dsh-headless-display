@@ -127,6 +127,10 @@ export function apply(ctx, config = {}) {
   //          逐窗口聚焦都可正常工作 —— 这是自动化优先的默认。
   // 需要 Wayland 客户端时：置 true，或在 iso_display_run 的 env 里显式给绝对路径。
   const exposeWaylandClients = config.exposeWaylandClients === true
+  // stop() 时是否顺带杀掉 DISPLAY 指向该 display 的客户端。
+  // 起因：`iso_display_run` 里用 `setsid ... &` 起的 GUI 程序与 display 没有父子关系，
+  // X server 一关它们**不一定**退出（游戏通常崩退，但普通 X 应用常变成孤儿）。
+  const killClientsOnStop = config.killClientsOnStop !== false
   const parentDisplay = config.parentDisplay || process.env.DISPLAY || ':1'
 
   // dsh 宿主进程通常**不继承**桌面会话的 DISPLAY/XAUTHORITY（实测：host env 里
@@ -660,6 +664,23 @@ export function apply(ctx, config = {}) {
     return n
   }
 
+  // 尽力而为：扫描 /proc/<pid>/environ，找出 DISPLAY 指向该 display 的进程。
+  // 很多桌面进程是 non-dumpable（读不到 environ），读不到就跳过 —— 宁漏勿错。
+  async function killClients(display, signal = 'SIGTERM') {
+    const killed = []
+    let entries = []
+    try { entries = readdirSync('/proc').filter((f) => /^\d+$/.test(f)) } catch { return killed }
+    for (const name of entries) {
+      const pid = Number(name)
+      if (pid === process.pid) continue
+      let env = ''
+      try { env = readFileSync(`/proc/${name}/environ`, { encoding: 'utf8' }) } catch { continue }
+      if (!env.split('\0').includes(`DISPLAY=${display}`)) continue
+      try { process.kill(pid, signal); killed.push(pid) } catch {}
+    }
+    return killed
+  }
+
   async function stop({ display } = {}) {
     display = normDisplay(display)
     const st = await readState(display)
@@ -683,6 +704,9 @@ export function apply(ctx, config = {}) {
         if (!pidAlive(st.pid)) break
       }
     }
+    // 先收客户端：X server 一关，很多 X 应用会变成没有家的孤儿进程
+    let clients = []
+    if (killClientsOnStop) clients = await killClients(display)
     // 兜底：状态文件缺失或被改写时，按命令行前缀精确收尾
     await killExactProcess('Xephyr', `${path.basename(bin.xephyr)} ${display} `)
     await killExactProcess('x11vnc', `x11vnc -display ${display} `)
@@ -699,7 +723,7 @@ export function apply(ctx, config = {}) {
       try { await rm(`/tmp/.X${n}-lock`, { force: true }) } catch {}
     }
     await rm(stateFile(display), { force: true })
-    return { display, killed }
+    return { display, killed, ...(clients.length ? { killedClients: clients } : {}) }
   }
 
   // ── 真实窗口（按需弹出 / 关闭）────────────────────────────────────────────

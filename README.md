@@ -247,6 +247,12 @@ iso_display_stop ":9"
 **已实测**：Desynced（Unreal 引擎、DX12、只有 Win64 二进制）在 `sway` 后端的隔离
 display 里**完整渲染、有声音、桌面上零窗口**。
 
+![Desynced 在隔离 display 里运行](docs/desynced-in-isolated-display.jpg)
+
+> 上图由 `iso_display_capture` 抓取（1280x720，`via: grim`，约 49 万色）。
+> 同一时间段内用户桌面的窗口清单**没有任何新增窗口**（只有 Steam 自身的通知气泡在闪），
+> 键盘/鼠标注入也能点到游戏菜单（可切换菜单项、打开子菜单）。
+
 ### 要点
 
 1. **必须用 `sway` 后端** —— Xvfb/Xephyr 无 DRI3，Vulkan 退到 llvmpipe，
@@ -324,6 +330,7 @@ iso_display_stop ":2"
 | `vncPortBase` | `5900` | 弹出真实窗口时 VNC 的起始端口（只监听回环） |
 | `allowForeignDisplays` | `false` | 是否允许操作**不是本插件启动的** display。默认拒绝，防止误操作到用户桌面 |
 | `exposeWaylandClients` | `false` | 是否把该实例的 wayland socket 交给子进程。默认 `false`＝全部钉到 X11，`xdotool` 可用 |
+| `killClientsOnStop` | `true` | `iso_display_stop` 时顺带杀掉 `DISPLAY` 指向该 display 的客户端（结果里返回 `killedClients`）。`setsid` 起的程序与 display 没有父子关系，不清理会留孤儿进程 |
 | `swayPath` / `grimPath` / `wayvncPath` / `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` / `xdpyinfoPath` / `xwininfoPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
 
 > ⚠️ `parentDisplay` 与 `xauthority` **建议显式配置** —— 见下面第 3 个坑。
@@ -509,6 +516,7 @@ ctx.inject(['betterSidebar'], cb)
 | `sway` 需要 `render` 组 | wlroots headless 要打开 `/dev/dri/renderD*`。不在组里会退到软件渲染（仍能跑，只是慢）。 |
 | `sway` 序号上限 20 | 只有 sway 进程**仍然活着**的序号才算占用；异常退出留下的 runDir 会在下次启动时被复用并清理。 |
 | **默认强制 X11** | 子进程被钉到 X11（`GDK_BACKEND` / `QT_QPA_PLATFORM` / `SDL_VIDEODRIVER` / `ELECTRON_OZONE_PLATFORM_HINT`）。只有 Wayland 后端的程序需要 `exposeWaylandClients: true`，但那时 `xdotool` 够不到它们的窗口。 |
+| **`setsid` 起的程序不保证随 display 退出** | `iso_display_stop` 会尽力清理 `DISPLAY` 指向该 display 的进程（`killClientsOnStop`，默认开），但读不到 `/proc/<pid>/environ` 的进程（non-dumpable）会被跳过 |
 | **外部 display 默认不可操作** | 防止误伤用户桌面；确需操作请设 `allowForeignDisplays: true` |
 | **x11vnc 在 sway 后端不可用** | 硬限制：Xwayland 上 `XGetImage` 会 `BadMatch`。插件已自动改用 `wayvnc`；手工调试时别混用。 |
 
@@ -579,6 +587,13 @@ ctx.inject(['betterSidebar'], cb)
 ---
 
 ## 更新日志
+
+### v1.3.2（第二轮黑盒测试收尾）
+
+- `iso_display_stop` 新增 `killClientsOnStop`（默认 `true`）：扫描 `/proc/*/environ`，
+  把 `DISPLAY` 指向该 display 的客户端一并收掉 —— `setsid` 起的 GUI 程序不会随
+  display 自动退出，实测会留下孤儿进程。结果里返回 `killedClients`。
+- README 增加 Desynced 在隔离 display 内的实测截图。
 
 ### v1.3.0（静默硬保证 + 跨发行版 + Proton 辅助脚本）
 
