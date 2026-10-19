@@ -330,6 +330,7 @@ iso_display_stop ":2"
 | `vncPortBase` | `5900` | 弹出真实窗口时 VNC 的起始端口（只监听回环） |
 | `allowForeignDisplays` | `false` | 是否允许操作**不是本插件启动的** display。默认拒绝，防止误操作到用户桌面 |
 | `exposeWaylandClients` | `false` | 是否把该实例的 wayland socket 交给子进程。默认 `false`＝全部钉到 X11，`xdotool` 可用 |
+| `staleDisplayMinutes` | `240` | `iso_display_list` 里超过这个存活时长的 display 会带 `stale: true`，`iso_display_doctor` 也会告警 —— 无人值守时用来发现「子智能体跑挂了但 display 还开着」的泄漏 |
 | `killClientsOnStop` | `true` | `iso_display_stop` 时顺带杀掉 `DISPLAY` 指向该 display 的客户端（结果里返回 `killedClients`）。`setsid` 起的程序与 display 没有父子关系，不清理会留孤儿进程 |
 | `swayPath` / `grimPath` / `wayvncPath` / `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` / `xdpyinfoPath` / `xwininfoPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
 
@@ -587,6 +588,13 @@ ctx.inject(['betterSidebar'], cb)
 ---
 
 ## 更新日志
+
+### v1.3.3（无人值守泄漏可见化）
+
+- `iso_display_list` 每条记录增加 `ageMinutes`，超过 `staleDisplayMinutes`（默认 240）
+  时带 `stale: true`；`iso_display_doctor` 在 `warnings` 里点名泄漏的 display。
+  由来：极简提示词的黑盒子智能体中途失败时会留下仍活着的 display，事后必须能一眼看见。
+- 新增只读诊断，不改变任何既有行为。
 
 ### v1.3.2（第二轮黑盒测试收尾）
 

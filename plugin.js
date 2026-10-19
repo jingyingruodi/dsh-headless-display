@@ -131,6 +131,9 @@ export function apply(ctx, config = {}) {
   // 起因：`iso_display_run` 里用 `setsid ... &` 起的 GUI 程序与 display 没有父子关系，
   // X server 一关它们**不一定**退出（游戏通常崩退，但普通 X 应用常变成孤儿）。
   const killClientsOnStop = config.killClientsOnStop !== false
+  // 无人值守时最容易出的问题不是崩溃，而是「忘了关」：子智能体中途失败会留下
+  // 一组仍然活着的 display。list 里给出存活时长与 stale 标记，doctor 里也会告警。
+  const staleDisplayMinutes = Number(config.staleDisplayMinutes) > 0 ? Number(config.staleDisplayMinutes) : 240
   const parentDisplay = config.parentDisplay || process.env.DISPLAY || ':1'
 
   // dsh 宿主进程通常**不继承**桌面会话的 DISPLAY/XAUTHORITY（实测：host env 里
@@ -335,6 +338,13 @@ export function apply(ctx, config = {}) {
       }
       // sway 后端才有 DRI3 → Vulkan/GL 能直通 GPU
       if (backendOf === 'sway') item.gpu = true
+      // 存活时长 / 疑似泄漏（无人值守时用来发现「忘了关」的 display）
+      const startedAt = Date.parse(st?.startedAt || '')
+      if (Number.isFinite(startedAt)) {
+        const ageMinutes = Math.max(0, Math.round((Date.now() - startedAt) / 60000))
+        item.ageMinutes = ageMinutes
+        if (ageMinutes > staleDisplayMinutes) item.stale = true
+      }
       out.push(item)
     }
     return out.sort((a, b) => a.display.localeCompare(b.display, undefined, { numeric: true }))
@@ -1138,6 +1148,15 @@ export function apply(ctx, config = {}) {
     const ok = missing.length === 0 && dirs.writable && (resolvedBackend !== 'sway' || dirs.runDirWritable)
     if (distro.family === 'unknown' && pkgs.length) warnings.push('未识别的发行版：安装命令只给了通用包名，请对照仓库确认')
     if (!x11.alive) warnings.push(`桌面 X display ${parentDisplay} 连不上：xephyr 后端与「弹出窗口后抬到前台」会受影响；headless 后端不受影响`)
+    // 无人值守时的「忘了关」检测：把存活超过 staleDisplayMinutes 的实例报出来
+    try {
+      const stale = (await listDisplays()).filter((d) => d.stale)
+      if (stale.length) {
+        warnings.push(`有 ${stale.length} 个 display 存活超过 ${staleDisplayMinutes} 分钟（可能有泄漏）：`
+          + stale.map((d) => `${d.display}(${d.ageMinutes}min)`).join('、')
+          + '；确认不再需要后 iso_display_stop 掉')
+      }
+    } catch {}
 
     return {
       ok, host: { os: process.platform, distro: distro.pretty, family: distro.family, kernel: os.release(), desktop: process.env.XDG_CURRENT_DESKTOP || '', sessionType: process.env.XDG_SESSION_TYPE || '' },
