@@ -138,6 +138,12 @@ export function apply(ctx, config = {}) {
   //   null sink（丢弃音频），并给子进程注入 PULSE_SINK。
   //   'inherit' = 保持旧行为（外放到用户扬声器）。
   const audioMode = config.audio === 'inherit' ? 'inherit' : 'null'
+  // ★ 本机实测：**任何新增音频 sink**（module-null-sink / module-pipe-sink 都一样，
+  //   甚至 Proton/Steam 自己创建的 sink 也一样）都会把用户默认声卡置为静音，
+  //   而且不是瞬时——置完就一直在。只靠「创建后恢复一次」挡不住中途出现的 sink。
+  //   所以只要本插件还有 display 活着，就由一个 200ms 的 keeper 持续把用户默认
+  //   设备的「默认指向 + 静音状态」拉回启动时记录的值。可用 protectUserAudio:false 关。
+  const protectUserAudioEnabled = config.protectUserAudio !== false
   const staleDisplayMinutes = Number(config.staleDisplayMinutes) > 0 ? Number(config.staleDisplayMinutes) : 240
   const parentDisplay = config.parentDisplay || process.env.DISPLAY || ':1'
 
@@ -519,6 +525,7 @@ export function apply(ctx, config = {}) {
         return { mode: 'unavailable', error: `pactl load-module 返回异常：${String(stdout).trim().slice(0, 120)}` }
       }
       const restored = await protectUserAudio(before)
+      startAudioKeeper(display, before)
       displayAudio.set(display, name)
       return {
         mode: 'null-sink', sink: name, moduleId,
@@ -529,6 +536,54 @@ export function apply(ctx, config = {}) {
     } catch (e) {
       return { mode: 'unavailable', error: String(e?.stderr || e?.message || e).trim().slice(0, 200) }
     }
+  }
+
+  // 每个 display 一个 keeper：200ms 轮询用户默认设备的「指向 + 静音」并纠正。
+  // 只纠正这两项，从不碰音量；display 停止即停。
+  const audioKeepers = new Map()
+
+  function startAudioKeeper(display, baseline) {
+    if (!protectUserAudioEnabled || !pactlPath || !baseline?.defaultSink) return
+    stopAudioKeeper(display)
+    const rec = { restores: 0, timer: null, sinkCount: null }
+    const countSinks = async () => {
+      try {
+        const { stdout } = await run(pactlPath, ['list', 'short', 'sinks'], { timeout: 4000 })
+        return String(stdout).split('\n').filter(Boolean).length
+      } catch { return null }
+    }
+    const tick = async () => {
+      try {
+        // ① 默认设备被指到本插件的 sink → 立刻改回用户原来的设备
+        const cur = await getDefaultSink()
+        if (cur && cur !== baseline.defaultSink && cur.startsWith('dsh-iso-')) {
+          try { await run(pactlPath, ['set-default-sink', baseline.defaultSink], { timeout: 4000 }) } catch {}
+          rec.restores++
+        }
+        // ② 仅在「sink 数量增加」时恢复静音：实测任何新增 sink 都会把默认设备静音；
+        //    用户自己手动静音（没有新 sink）不会被我们抢回去。
+        const n = await countSinks()
+        const grew = n !== null && rec.sinkCount !== null && n > rec.sinkCount
+        if (n !== null) rec.sinkCount = n
+        if (!grew) return
+        const now = await getSinkMute(baseline.defaultSink)
+        if (typeof baseline.muted === 'boolean' && now !== null && now !== baseline.muted) {
+          if (await setSinkMute(baseline.defaultSink, baseline.muted)) rec.restores++
+        }
+      } catch {}
+    }
+    rec.timer = setInterval(tick, 250)
+    rec.timer.unref?.()
+    countSinks().then((n) => { rec.sinkCount = n })
+    audioKeepers.set(display, rec)
+  }
+
+  function stopAudioKeeper(display) {
+    const rec = audioKeepers.get(display)
+    if (!rec) return 0
+    if (rec.timer) clearInterval(rec.timer)
+    audioKeepers.delete(display)
+    return rec.restores
   }
 
   async function teardownAudio(display, st) {
@@ -867,6 +922,7 @@ export function apply(ctx, config = {}) {
     if (st?.confPath) { try { await rm(st.confPath, { force: true }) } catch {} }
     displayAuth.delete(display)
     displayWayland.delete(display)
+    const audioRestores = stopAudioKeeper(display)
     await teardownAudio(display, st)
     // Xvfb / Xephyr / Xwayland 被杀后可能留下 socket 与 lock；
     // 不清掉会永久占住该序号（旧实现正是这样把区间耗尽的）。
@@ -876,7 +932,11 @@ export function apply(ctx, config = {}) {
       try { await rm(`/tmp/.X${n}-lock`, { force: true }) } catch {}
     }
     await rm(stateFile(display), { force: true })
-    return { display, killed, ...(clients.length ? { killedClients: clients } : {}) }
+    return {
+      display, killed,
+      ...(clients.length ? { killedClients: clients } : {}),
+      ...(audioRestores ? { userAudioRestores: audioRestores } : {}),
+    }
   }
 
   // ── 真实窗口（按需弹出 / 关闭）────────────────────────────────────────────

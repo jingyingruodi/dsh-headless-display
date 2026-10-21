@@ -123,7 +123,12 @@ PulseAudio / PipeWire 客户端（paplay、SDL/ffplay、Proton/Wine 的 winepuls
 > 这会把「静默隔离」变成「把用户正在听的音乐/游戏静音」—— 用户实测抓到过。
 >
 > 现在的做法：创建前记录默认设备与静音状态 → 创建后立刻恢复（结果里
-> `audio.keptUserAudioUnmuted: true`）→ `iso_display_stop` 卸载后再恢复一次。
+> `audio.keptUserAudioUnmuted: true`）→ **display 存活期间还有一个 250ms 的 keeper**：
+> 一旦发现「sink 数量增加」（不论是谁加的，包括 Proton/Steam 自己建的 sink），
+> 就把用户的默认设备与静音状态拉回启动时的值；`iso_display_stop` 卸载后再恢复一次。
+> keeper **只在新 sink 出现时动作**，所以用户自己手动静音不会被抢回去；
+> 也不要碰音量。结果里会返回 `userAudioRestores`（一共纠正了几次）。
+> 可用 `protectUserAudio: false` 完全关掉。
 > sink 同时带 `node.hidden=true`，不会出现在桌面音量面板里。
 
 > 配置 `audio: 'inherit'` 可回到旧行为（声音外放，非静默）。
@@ -371,6 +376,7 @@ iso_display_stop ":2"
 | `vncPortBase` | `5900` | 弹出真实窗口时 VNC 的起始端口（只监听回环） |
 | `allowForeignDisplays` | `false` | 是否允许操作**不是本插件启动的** display。默认拒绝，防止误操作到用户桌面 |
 | `exposeWaylandClients` | `false` | 是否把该实例的 wayland socket 交给子进程。默认 `false`＝全部钉到 X11，`xdotool` 可用 |
+| `protectUserAudio` | `true` | display 存活期间用 250ms keeper 守住用户的默认设备与静音状态（新增 sink 会让默认设备静音）。设为 `false` 可关闭 |
 | `audio` | `null` | 音频隔离模式。`null`＝每个 display 建一个 null sink 并给子进程注入 `PULSE_SINK`（声音被丢弃，真静默）；`inherit`＝沿用用户默认声卡（会外放） |
 | `staleDisplayMinutes` | `240` | `iso_display_list` 里超过这个存活时长的 display 会带 `stale: true`，`iso_display_doctor` 也会告警 —— 无人值守时用来发现「子智能体跑挂了但 display 还开着」的泄漏 |
 | `killClientsOnStop` | `true` | `iso_display_stop` 时顺带杀掉 `DISPLAY` 指向该 display 的客户端（结果里返回 `killedClients`）。`setsid` 起的程序与 display 没有父子关系，不清理会留孤儿进程 |
@@ -631,6 +637,15 @@ ctx.inject(['betterSidebar'], cb)
 ---
 
 ## 更新日志
+
+### v1.4.1（守住用户的静音状态）
+
+- 实测确认：本机**任何**新增 sink（module-null-sink / module-pipe-sink / Proton 自建）
+  都会把用户默认声卡置为静音，且不只发生在创建瞬间 —— 测试中途出现新 sink 时会再静音一次。
+- 新增 `protectUserAudio`（默认开）：display 存活期间每 250ms 检查一次，
+  **仅当 sink 数量增加时**把默认设备与静音状态拉回启动时的值；用户自己手动静音不受影响。
+- `iso_display_stop` 返回 `userAudioRestores`（纠正次数）。
+- 实测：外部新 sink 造成静音 → 800ms 内恢复；外部手动静音 → 保持不被抢回。
 
 ### v1.4.0（音频也静默，且不碰用户正在听的音频）
 

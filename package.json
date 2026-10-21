@@ -1,6 +1,6 @@
 {
   "name": "dsh-headless-display",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": true,
   "type": "module",
   "description": "隔离的 headless display：默认桌面上零窗口、零干扰；sway 后端提供 DRI3，Vulkan/GL 直通 GPU，可跑 Proton/DX 游戏；面板里可实时查看与操作，按需弹出真实窗口。画面与音频双静默；给 Agent 10 个工具（含环境自检）+ HTTP API。",
