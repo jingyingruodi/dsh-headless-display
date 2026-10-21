@@ -90,6 +90,47 @@ X11 客户端由 Xwayland（sway 后端）或 Xvfb 承载，于是 `xdotool`（X
 > `WAYLAND_DISPLAY`（如 `/run/user/1000/dsh-iso-1/wayland-1`）。
 > 代价：xdotool 够不到那些 Wayland 窗口，键鼠注入会失效。
 
+### ③ 画面隔离了，声音没有
+
+隔离 display 只换掉了 X server / Wayland compositor，**音频仍然走用户默认声卡**。
+实测：在隔离 display 里起 Desynced，主菜单音乐从头到尾从扬声器放出来 ——
+「静默」只做到了一半。
+
+现在 `iso_display_start` 会给每个 display 建一个 **null sink**（音频丢弃）：
+
+```text
+pactl load-module module-null-sink sink_name=dsh-iso-2 …
+```
+
+`iso_display_run` 起的进程被注入 `PULSE_SINK=dsh-iso-2`，于是
+PulseAudio / PipeWire 客户端（paplay、SDL/ffplay、Proton/Wine 的 winepulse…）
+的音频全部落进这个 sink，**扬声器一点声音都没有**，而程序侧的音频初始化完全正常
+（不会因为「没有声卡」报错或卡住）。`iso_display_stop` 会卸载对应 module。
+
+实测（本机 PipeWire 1.4.2）：
+
+| 客户端 | 结果 |
+|---|---|
+| `paplay`（libpulse 路径） | `Connected to device dsh-iso-2 (index: 5810)` —— 落在 null sink |
+| `ffplay`（SDL 路径，多数游戏引擎同源） | sink-input 出现在 `dsh-iso-*`，默认声卡无新增流 |
+| 用户自己的游戏（Terraria） | 仍在默认声卡上，完全不受影响 |
+
+> ⚠️ **踩坑：创建虚拟 sink 会把用户的默认声卡静音**
+>
+> 本机（PipeWire 1.4.2 + WirePlumber + KDE）实测：只要新增一个虚拟 sink
+> （`pactl load-module module-null-sink` 或 `pw-cli create-node adapter` 都一样），
+> **用户默认输出设备立刻变成静音**（`pactl get-sink-mute` → `yes`），而且卸载后不会自动恢复。
+> 这会把「静默隔离」变成「把用户正在听的音乐/游戏静音」—— 用户实测抓到过。
+>
+> 现在的做法：创建前记录默认设备与静音状态 → 创建后立刻恢复（结果里
+> `audio.keptUserAudioUnmuted: true`）→ `iso_display_stop` 卸载后再恢复一次。
+> sink 同时带 `node.hidden=true`，不会出现在桌面音量面板里。
+
+> 配置 `audio: 'inherit'` 可回到旧行为（声音外放，非静默）。
+> `iso_display_doctor` 会报告 `audio: {mode, pactl, server, defaultSink, isolatedSinks}`，
+> 缺 `pactl` 或声音服务连不上时告警「声音会从扬声器出来」。
+> **盲点**：直接打开 ALSA 设备（`aplay -D hw:0`）或自带音频后端的程序绕过 Pulse，不会被隔离。
+
 ### 验证方法（本仓库作者的实测做法）
 
 KDE 下用 KWin 脚本（`org.kde.kwin.Scripting`）每 2 秒采样一次窗口清单，
@@ -245,7 +286,7 @@ iso_display_stop ":9"
 ## 跑 Windows / DX 游戏（Proton / Steam 兼容套件）
 
 **已实测**：Desynced（Unreal 引擎、DX12、只有 Win64 二进制）在 `sway` 后端的隔离
-display 里**完整渲染、有声音、桌面上零窗口**。
+display 里**完整渲染、桌面上零窗口**；音频默认被丢进该 display 的 null sink，**不会从扬声器出来**。
 
 ![Desynced 在隔离 display 里运行](docs/desynced-in-isolated-display.jpg)
 
@@ -330,6 +371,7 @@ iso_display_stop ":2"
 | `vncPortBase` | `5900` | 弹出真实窗口时 VNC 的起始端口（只监听回环） |
 | `allowForeignDisplays` | `false` | 是否允许操作**不是本插件启动的** display。默认拒绝，防止误操作到用户桌面 |
 | `exposeWaylandClients` | `false` | 是否把该实例的 wayland socket 交给子进程。默认 `false`＝全部钉到 X11，`xdotool` 可用 |
+| `audio` | `null` | 音频隔离模式。`null`＝每个 display 建一个 null sink 并给子进程注入 `PULSE_SINK`（声音被丢弃，真静默）；`inherit`＝沿用用户默认声卡（会外放） |
 | `staleDisplayMinutes` | `240` | `iso_display_list` 里超过这个存活时长的 display 会带 `stale: true`，`iso_display_doctor` 也会告警 —— 无人值守时用来发现「子智能体跑挂了但 display 还开着」的泄漏 |
 | `killClientsOnStop` | `true` | `iso_display_stop` 时顺带杀掉 `DISPLAY` 指向该 display 的客户端（结果里返回 `killedClients`）。`setsid` 起的程序与 display 没有父子关系，不清理会留孤儿进程 |
 | `swayPath` / `grimPath` / `wayvncPath` / `xephyrPath` / `xvfbPath` / `x11vncPath` / `viewerPath` / `xdotoolPath` / `importPath` / `xdpyinfoPath` / `xwininfoPath` | 按名字在 PATH 查找 | 自定义可执行文件路径 |
@@ -517,6 +559,7 @@ ctx.inject(['betterSidebar'], cb)
 | `sway` 需要 `render` 组 | wlroots headless 要打开 `/dev/dri/renderD*`。不在组里会退到软件渲染（仍能跑，只是慢）。 |
 | `sway` 序号上限 20 | 只有 sway 进程**仍然活着**的序号才算占用；异常退出留下的 runDir 会在下次启动时被复用并清理。 |
 | **默认强制 X11** | 子进程被钉到 X11（`GDK_BACKEND` / `QT_QPA_PLATFORM` / `SDL_VIDEODRIVER` / `ELECTRON_OZONE_PLATFORM_HINT`）。只有 Wayland 后端的程序需要 `exposeWaylandClients: true`，但那时 `xdotool` 够不到它们的窗口。 |
+| **音频隔离有盲点** | 只有走 PulseAudio/PipeWire 客户端的程序会被 `PULSE_SINK` 接管；直接打开 ALSA 设备或自带音频后端的程序仍会外放。`iso_display_doctor` 会检查 `pactl` 是否可用 |
 | **`setsid` 起的程序不保证随 display 退出** | `iso_display_stop` 会尽力清理 `DISPLAY` 指向该 display 的进程（`killClientsOnStop`，默认开），但读不到 `/proc/<pid>/environ` 的进程（non-dumpable）会被跳过 |
 | **外部 display 默认不可操作** | 防止误伤用户桌面；确需操作请设 `allowForeignDisplays: true` |
 | **x11vnc 在 sway 后端不可用** | 硬限制：Xwayland 上 `XGetImage` 会 `BadMatch`。插件已自动改用 `wayvnc`；手工调试时别混用。 |
@@ -588,6 +631,18 @@ ctx.inject(['betterSidebar'], cb)
 ---
 
 ## 更新日志
+
+### v1.4.0（音频也静默，且不碰用户正在听的音频）
+
+- **音频隔离**：每个 display 建一个隐藏的 `module-null-sink`（`dsh-iso-<N>`），
+  `iso_display_run` 起的进程注入 `PULSE_SINK`，音频被丢弃；`iso_display_stop` 卸载。
+  实测 paplay（libpulse）与 ffplay（SDL）的流都落在 `dsh-iso-*`，用户自己的
+  游戏流（Terraria）仍在默认声卡，互不影响。
+- **不静音用户音频**：创建虚拟 sink 会让默认声卡静音（PipeWire 1.4.2 实测），
+  现在创建/卸载前后都会记录并恢复用户的默认设备与静音状态。
+- sink 带 `node.hidden=true`，不出现在音量面板。
+- 配置 `audio: 'null' | 'inherit'`（默认 `null`）。
+- `iso_display_doctor` 新增 `audio` 段（pactl/服务端/默认 sink/已存在的隔离 sink）。
 
 ### v1.3.3（无人值守泄漏可见化）
 

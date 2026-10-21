@@ -133,6 +133,11 @@ export function apply(ctx, config = {}) {
   const killClientsOnStop = config.killClientsOnStop !== false
   // 无人值守时最容易出的问题不是崩溃，而是「忘了关」：子智能体中途失败会留下
   // 一组仍然活着的 display。list 里给出存活时长与 stale 标记，doctor 里也会告警。
+  // ★ 音频也必须静默：隔离 display 里的程序默认连的是**用户默认声卡**，
+  //   测试一跑就能听见声音（实测被用户抓到）。这里给每个 display 建一个
+  //   null sink（丢弃音频），并给子进程注入 PULSE_SINK。
+  //   'inherit' = 保持旧行为（外放到用户扬声器）。
+  const audioMode = config.audio === 'inherit' ? 'inherit' : 'null'
   const staleDisplayMinutes = Number(config.staleDisplayMinutes) > 0 ? Number(config.staleDisplayMinutes) : 240
   const parentDisplay = config.parentDisplay || process.env.DISPLAY || ':1'
 
@@ -168,6 +173,8 @@ export function apply(ctx, config = {}) {
   // display → socket 的**绝对路径**，供 envFor() 注入：Wayland 原生程序（GTK4 /
   // Qt6 / Electron）于是渲染进隔离合成器，而不是用户桌面。
   const displayWayland = new Map()
+  // display → 该实例专用 null sink 的名字（音频隔离）
+  const displayAudio = new Map()
 
   const envFor = (display) => {
     const env = { ...process.env, DISPLAY: display }
@@ -195,6 +202,9 @@ export function apply(ctx, config = {}) {
       env.ELECTRON_OZONE_PLATFORM_HINT = 'x11'
       env.XDG_SESSION_TYPE = 'x11'
     }
+    // 音频：把子进程的流钉到这个 display 专用的 null sink（听不到声音）
+    const sink = displayAudio.get(display)
+    if (sink) env.PULSE_SINK = sink
     if (displayAuth.has(display)) {
       // 已经探明了这个 display 的鉴权方式：'' 表示它**不需要**鉴权
       // （sway 的 Xwayland 常如此，它没带 -auth 参数）
@@ -308,6 +318,7 @@ export function apply(ctx, config = {}) {
           // 注意：'' 是有意义的值（该 display 无需鉴权），所以判「键存在」而非真值
           if (st && 'xauthority' in st) displayAuth.set(d, st.xauthority || '')
           if (st?.runDir && st?.waylandDisplay) displayWayland.set(d, path.join(st.runDir, st.waylandDisplay))
+          if (st?.audioSink) displayAudio.set(d, st.audioSink)
         } catch {}
       }
     }
@@ -425,6 +436,121 @@ export function apply(ctx, config = {}) {
       }
     } catch {}
     return ''
+  }
+
+  // ── 音频隔离 ─────────────────────────────────────────────────────────────
+  // 隔离 display 只隔离了画面，**没有隔离声音**：子进程默认连用户默认声卡，
+  // 测试里一放音就从扬声器出来（用户实测抓到）。这里给每个 display 建一个
+  // null sink（音频丢弃），子进程通过 PULSE_SINK 被钉上去。
+  const pactlPath = which('pactl')
+  const audioSinkName = (display) => `dsh-iso-${String(display).replace(':', '')}`
+
+  async function getDefaultSink() {
+    if (!pactlPath) return null
+    try {
+      const { stdout } = await run(pactlPath, ['get-default-sink'], { timeout: 4000 })
+      return String(stdout).trim() || null
+    } catch { return null }
+  }
+
+  async function getSinkMute(name) {
+    if (!pactlPath || !name) return null
+    try {
+      const { stdout } = await run(pactlPath, ['get-sink-mute', name], { timeout: 4000 })
+      return /yes/i.test(String(stdout))
+    } catch { return null }
+  }
+
+  async function setSinkMute(name, muted) {
+    if (!pactlPath || !name || typeof muted !== 'boolean') return false
+    try {
+      await run(pactlPath, ['set-sink-mute', name, muted ? '1' : '0'], { timeout: 4000 })
+      return true
+    } catch { return false }
+  }
+
+  // 找出某个 sink 的 Owner Module（用于按名字清理同名残留）
+  async function sinkOwnerModule(name) {
+    if (!pactlPath) return null
+    try {
+      const { stdout } = await run(pactlPath, ['list', 'sinks'], { timeout: 8000 })
+      for (const block of String(stdout).split(/\n(?=Sink #)/)) {
+        if (!block.includes(`Name: ${name}`)) continue
+        const m = block.match(/Owner Module:\s*(\d+)/)
+        if (m && Number(m[1]) > 0) return Number(m[1])
+      }
+    } catch {}
+    return null
+  }
+
+  // ★ 本机（PipeWire 1.4.2 + WirePlumber + KDE）实测：**只要新增一个虚拟 sink，
+  //   用户默认声卡就会被置为静音**（pactl load-module 和 pw-cli 都一样）。
+  //   这会让「静默隔离」变成「把用户正在听的音乐/游戏静音」—— 用户实测抓到过。
+  //   所以创建前后都必须记录并恢复用户的默认输出设备与静音状态。
+  async function protectUserAudio(before) {
+    const after = await getDefaultSink()
+    if (before?.defaultSink && after && after !== before.defaultSink && after.startsWith('dsh-iso-')) {
+      try { await run(pactlPath, ['set-default-sink', before.defaultSink], { timeout: 4000 }) } catch {}
+    }
+    const target = before?.defaultSink || after
+    if (!target || target.startsWith('dsh-iso-')) return false
+    if (typeof before?.muted === 'boolean') {
+      const now = await getSinkMute(target)
+      if (now !== null && now !== before.muted) return setSinkMute(target, before.muted)
+    }
+    return false
+  }
+
+  async function setupAudio(display) {
+    if (audioMode === 'inherit') return { mode: 'inherit' }
+    if (!pactlPath) return { mode: 'unavailable', error: 'pactl 未安装（Debian: pulseaudio-utils 或 pipewire-pulse）' }
+    const name = audioSinkName(display)
+    // 清掉同名残留（上次异常退出留下的），避免出现两个同名 sink
+    const staleOwner = await sinkOwnerModule(name)
+    if (staleOwner) { try { await run(pactlPath, ['unload-module', String(staleOwner)], { timeout: 5000 }) } catch {} }
+    const before = { defaultSink: await getDefaultSink(), muted: null }
+    before.muted = await getSinkMute(before.defaultSink)
+    try {
+      const { stdout } = await run(pactlPath, ['load-module', 'module-null-sink',
+        `sink_name=${name}`,
+        `sink_properties=device.description=DSH-isolated-${name} node.hidden=true`], { timeout: 8000 })
+      const moduleId = Number(String(stdout).trim())
+      if (!Number.isFinite(moduleId) || moduleId <= 0) {
+        return { mode: 'unavailable', error: `pactl load-module 返回异常：${String(stdout).trim().slice(0, 120)}` }
+      }
+      const restored = await protectUserAudio(before)
+      displayAudio.set(display, name)
+      return {
+        mode: 'null-sink', sink: name, moduleId,
+        userDefaultSink: before.defaultSink,
+        userDefaultMuted: before.muted,
+        ...(restored ? { keptUserAudioUnmuted: true } : {}),
+      }
+    } catch (e) {
+      return { mode: 'unavailable', error: String(e?.stderr || e?.message || e).trim().slice(0, 200) }
+    }
+  }
+
+  async function teardownAudio(display, st) {
+    displayAudio.delete(display)
+    if (!pactlPath) return
+    const name = st?.audioSink || audioSinkName(display)
+    let moduleId = st?.audioModule
+    if (!moduleId) {
+      // 旧状态文件里没有 module id：从 pactl 的 sink 列表按 Owner Module 反查
+      try {
+        const { stdout } = await run(pactlPath, ['list', 'sinks'], { timeout: 8000 })
+        for (const block of String(stdout).split(/\n(?=Sink #)/)) {
+          if (!block.includes(`Name: ${name}`)) continue
+          const m = block.match(/Owner Module:\s*(\d+)/)
+          if (m) moduleId = Number(m[1])
+        }
+      } catch {}
+    }
+    if (!moduleId) return
+    try { await run(pactlPath, ['unload-module', String(moduleId)], { timeout: 5000 }) } catch {}
+    // 卸载虚拟 sink 同样可能把用户默认设备静音，按状态里记录的值恢复
+    await protectUserAudio({ defaultSink: st?.audioUserSink || null, muted: st?.audioUserMuted })
   }
 
   // ── 进程归属 / 预检 ──────────────────────────────────────────────────────
@@ -570,17 +696,22 @@ export function apply(ctx, config = {}) {
       waylandDisplay = (await readdir(runDir)).find((f) => f.startsWith('wayland-') && !f.endsWith('.lock')) || ''
     } catch {}
     if (waylandDisplay) displayWayland.set(target, path.join(runDir, waylandDisplay))
+    const audio = await setupAudio(target)
     const st = {
       size, pid: child.pid, backend: 'sway', display: target, runDir, confPath,
       ...(waylandDisplay ? { waylandDisplay } : {}),
       xauthority: auth,
+      ...(audio.mode === 'null-sink' ? {
+        audioSink: audio.sink, audioModule: audio.moduleId,
+        audioUserSink: audio.userDefaultSink, audioUserMuted: audio.userDefaultMuted,
+      } : {}),
       parentDisplay, startedAt: new Date().toISOString(),
     }
     await writeFile(stateFile(target), JSON.stringify(st, null, 2))
     return {
       display: target, size, pid: child.pid, backend: 'sway', visible: false,
       runDir, ...(waylandDisplay ? { waylandDisplay } : {}),
-      xauthority: auth, gpu: true,
+      xauthority: auth, gpu: true, audio,
       note: '该 display 有 DRI3，Vulkan/GL 直通 GPU，可跑 Proton/DXVK/VKD3D 游戏',
     }
   }
@@ -626,9 +757,20 @@ export function apply(ctx, config = {}) {
           try { process.kill(child.pid, 'SIGKILL') } catch {}
           throw new Error(`${target} 的 X 锁属于 pid ${owner}，不是本次启动的 ${child.pid} —— 编号被并发占用，请重试`)
         }
-        const st = { size, pid: child.pid, backend: whichBackend, parentDisplay, startedAt: new Date().toISOString() }
+        const audio = await setupAudio(target)
+        const st = {
+          size, pid: child.pid, backend: whichBackend, parentDisplay,
+          ...(audio.mode === 'null-sink' ? {
+            audioSink: audio.sink, audioModule: audio.moduleId,
+            audioUserSink: audio.userDefaultSink, audioUserMuted: audio.userDefaultMuted,
+          } : {}),
+          startedAt: new Date().toISOString(),
+        }
         await writeFile(stateFile(target), JSON.stringify(st, null, 2))
-        return { display: target, size, pid: child.pid, backend: whichBackend, visible: whichBackend === 'xephyr', parentDisplay, silent: whichBackend !== 'xephyr' }
+        return {
+          display: target, size, pid: child.pid, backend: whichBackend,
+          visible: whichBackend === 'xephyr', parentDisplay, silent: whichBackend !== 'xephyr', audio,
+        }
       }
     }
     try { process.kill(-child.pid, 'SIGKILL') } catch {}
@@ -725,6 +867,7 @@ export function apply(ctx, config = {}) {
     if (st?.confPath) { try { await rm(st.confPath, { force: true }) } catch {} }
     displayAuth.delete(display)
     displayWayland.delete(display)
+    await teardownAudio(display, st)
     // Xvfb / Xephyr / Xwayland 被杀后可能留下 socket 与 lock；
     // 不清掉会永久占住该序号（旧实现正是这样把区间耗尽的）。
     const n = String(display).replace(':', '')
@@ -1148,6 +1291,37 @@ export function apply(ctx, config = {}) {
     const ok = missing.length === 0 && dirs.writable && (resolvedBackend !== 'sway' || dirs.runDirWritable)
     if (distro.family === 'unknown' && pkgs.length) warnings.push('未识别的发行版：安装命令只给了通用包名，请对照仓库确认')
     if (!x11.alive) warnings.push(`桌面 X display ${parentDisplay} 连不上：xephyr 后端与「弹出窗口后抬到前台」会受影响；headless 后端不受影响`)
+    // 音频隔离能力：没这套东西，隔离 display 里的声音会从用户扬声器出来
+    const audio = {
+      mode: audioMode, pactl: !!pactlPath, available: false,
+      server: null, defaultSink: null, isolatedSinks: [],
+    }
+    if (pactlPath) {
+      try {
+        const { stdout } = await run(pactlPath, ['info'], { timeout: 5000 })
+        audio.available = true
+        audio.server = (String(stdout).match(/Server Name:\s*(.+)/) || [])[1]?.trim() || null
+      } catch {}
+      try {
+        const { stdout } = await run(pactlPath, ['get-default-sink'], { timeout: 5000 })
+        audio.defaultSink = String(stdout).trim() || null
+      } catch {}
+      try {
+        const { stdout } = await run(pactlPath, ['list', 'short', 'sinks'], { timeout: 5000 })
+        audio.isolatedSinks = String(stdout).split('\n')
+          .filter((l) => l.includes('dsh-iso-')).map((l) => l.split('\t')[1]).filter(Boolean)
+      } catch {}
+    }
+    if (audioMode === 'null' && !audio.available) {
+      const hint = {
+        debian: 'sudo apt install -y pulseaudio-utils',
+        fedora: 'sudo dnf install -y pulseaudio-utils',
+        arch: 'sudo pacman -S --needed libpulse',
+      }[distro.family] || '安装 pactl（pulseaudio-utils / pipewire-pulse）'
+      warnings.push(`音频隔离不可用：pactl 缺失或声音服务连不上，隔离 display 里的声音会从**用户扬声器**出来。${hint}`)
+    }
+    if (audioMode === 'inherit') warnings.push("audio: 'inherit' —— 隔离 display 的声音会从用户扬声器出来（非静默）")
+
     // 无人值守时的「忘了关」检测：把存活超过 staleDisplayMinutes 的实例报出来
     try {
       const stale = (await listDisplays()).filter((d) => d.stale)
@@ -1169,7 +1343,7 @@ export function apply(ctx, config = {}) {
         xvfb: { available: !!(which(bin.xvfb) && which(bin.xdpyinfo)) },
         xephyr: { available: !!(which(bin.xephyr) && x11.alive) },
       },
-      deps, missing, install, gpu, dirs, x11, warnings,
+      deps, missing, install, gpu, dirs, x11, audio, warnings,
       next: ok
         ? (resolvedBackend === 'sway'
           ? 'sway 后端可用（有 GPU）→ 直接 iso_display_start，桌面零窗口'
